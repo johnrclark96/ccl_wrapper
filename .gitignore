@@ -1,0 +1,29 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Venvs (should not exist here, but ignore anyway)
+venv/
+.venv/
+
+# Outputs/logs/artifacts (should not exist here, but ignore anyway)
+out*/
+decoded/
+_private/
+*.log
+*.jsonl
+*.csv
+*.sqlite
+*.db
+fatal.txt
+errors*.jsonl
+run_log.txt
+console.log
+
+# OS/editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
