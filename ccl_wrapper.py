@@ -72,7 +72,8 @@ _FATAL_OUT_DIR: Optional[Path] = None
 _FATAL_ERRORS_PATH: Optional[Path] = None
 
 def utc_now_iso() -> str:
-    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    tz = getattr(_dt, "UTC", _dt.timezone.utc)
+    return _dt.datetime.now(tz).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def safe_mkdir(p: Path) -> None:
@@ -275,7 +276,8 @@ def capture_fatal_exception(exc: BaseException, *, out_dir: Optional[Path], erro
         fatal_path = out_dir / "fatal.txt"
     else:
         temp_dir = Path(os.getenv("TEMP") or os.getenv("TMPDIR") or tempfile.gettempdir())
-        timestamp = _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        tz = getattr(_dt, "UTC", _dt.timezone.utc)
+        timestamp = _dt.datetime.now(tz).strftime("%Y%m%d_%H%M%S")
         fatal_path = temp_dir / f"ccl_fatal_{timestamp}.txt"
         print(f"fatal traceback written to: {fatal_path}", file=sys.stderr, flush=True)
 
@@ -342,7 +344,7 @@ def warn_once(key_parts, message):
     if key in _WARN_ONCE_KEYS:
         return False
     _WARN_ONCE_KEYS.add(key)
-    log(f"WARNING: {message}")
+    print(f"WARNING: {message}", flush=True)
     return True
 
 def log_error_event(
@@ -417,6 +419,7 @@ def smart_decode_payload(
     out_dir: Optional[Path] = None,
     limits: Optional[Dict[str, Any]] = None,
     payload_subdir: Optional[Union[str, Path]] = None,
+    context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Best-effort local decode/decompress/extract for bytes-like payloads.
@@ -446,6 +449,7 @@ def smart_decode_payload(
     }
 
     try:
+        _ = context
         if payload is None:
             info["kind"] = "none"
             return info
@@ -1570,34 +1574,33 @@ def export_downloads(profile_obj: Any, prof_dir: Path, profile_out_dir: Path, ro
             except Exception:
                 pass
 
-
-def _iter_downloads_shared_proto_db():
-    # Returns an iterator of download objects from shared_proto_db, if available.
-    if shared_proto_db_downloads is None:
-        return iter(())
-    shared_dir = prof_dir / "shared_proto_db"
-    if not (shared_dir.exists() and shared_dir.is_dir()):
-        return iter(())
-
-    if hasattr(shared_proto_db_downloads, "read_downloads"):
-        try:
-            return shared_proto_db_downloads.read_downloads(str(shared_dir))
-        except Exception:
+    def _iter_downloads_shared_proto_db() -> Iterator[Any]:
+        # Returns an iterator of download objects from shared_proto_db, if available.
+        if shared_proto_db_downloads is None:
+            return iter(())
+        shared_dir = prof_dir / "shared_proto_db"
+        if not (shared_dir.exists() and shared_dir.is_dir()):
             return iter(())
 
-    if hasattr(shared_proto_db_downloads, "OpenDownloadsDb"):
-        def _gen():
-            for open_arg in (shared_dir, prof_dir):
-                try:
-                    db = shared_proto_db_downloads.OpenDownloadsDb(str(open_arg))
-                    for d in db.iter_downloads():
-                        yield d
-                    return
-                except Exception:
-                    continue
-        return _gen()
+        if hasattr(shared_proto_db_downloads, "read_downloads"):
+            try:
+                return shared_proto_db_downloads.read_downloads(str(shared_dir))
+            except Exception:
+                return iter(())
 
-    return iter(())
+        if hasattr(shared_proto_db_downloads, "OpenDownloadsDb"):
+            def _gen():
+                for open_arg in (shared_dir, prof_dir):
+                    try:
+                        db = shared_proto_db_downloads.OpenDownloadsDb(str(open_arg))
+                        for d in db.iter_downloads():
+                            yield d
+                        return
+                    except Exception:
+                        continue
+            return _gen()
+
+        return iter(())
 
     def _call_download_iterator(fn: Any) -> Iterator[Any]:
         # Some ccl versions expect in_dir/profile_dir; feature-detect.
@@ -2352,7 +2355,7 @@ def export_indexeddb(
                 iterator = profile_obj.iter_indexeddb_records(host_id, include_deletions=True)
             except Exception as e:
                 result["errors"] += 1
-                logger.warn_once(f"indexeddb_iter_records|{host_id}|{type(e).__name__}", f"iter_indexeddb_records failed for host {host_id}: {e}")
+                logger.warn(f"iter_indexeddb_records failed for host {host_id}: {e}")
                 continue
 
             # Consume iterator; any exception mid-stream should not kill other hosts.
@@ -2363,7 +2366,7 @@ def export_indexeddb(
                     break
                 except Exception as e:
                     result["errors"] += 1
-                    logger.warn_once(f"indexeddb_iter_stream|{host_id}|{type(e).__name__}", f"IndexedDB iteration error for host {host_id}: {e}")
+                    logger.warn(f"IndexedDB iteration error for host {host_id}: {e}")
                     break
 
                 result["records"] += 1
@@ -2867,7 +2870,8 @@ def main() -> int:
     args = ap.parse_args()
 
     root = Path(args.root).expanduser() if args.root else None
-    out_dir = Path(args.out).resolve() if args.out else ((root or Path.cwd()) / f"ccl_reader_export_{_dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
+    tz = getattr(_dt, "UTC", _dt.timezone.utc)
+    out_dir = Path(args.out).resolve() if args.out else ((root or Path.cwd()) / f"ccl_reader_export_{_dt.datetime.now(tz).strftime('%Y%m%d_%H%M%S')}")
     safe_mkdir(out_dir)
     global _FATAL_OUT_DIR, _FATAL_ERRORS_PATH
     _FATAL_OUT_DIR = out_dir
