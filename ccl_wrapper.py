@@ -35,12 +35,14 @@ import hashlib
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import sqlite3
 import sys
 import threading
 import traceback
+import tempfile
 import time
 from collections import Counter
 from dataclasses import is_dataclass, asdict
@@ -65,6 +67,9 @@ except Exception:
 # -----------------------------
 # Small utilities
 # -----------------------------
+
+_FATAL_OUT_DIR: Optional[Path] = None
+_FATAL_ERRORS_PATH: Optional[Path] = None
 
 def utc_now_iso() -> str:
     return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -236,6 +241,64 @@ def write_json(path: Path, obj: Any) -> None:
         json.dump(jsonable(obj), f, ensure_ascii=False, indent=2)
         f.write("\n")
 
+def build_self_check() -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "python_version": sys.version,
+        "sys.executable": sys.executable,
+        "sys.prefix": sys.prefix,
+        "platform": platform.platform(),
+        "ccl_chromium_reader_version": None,
+        "ccl_chromium_reader_module_path": None,
+        "sys_path_head": list(sys.path[:10]),
+    }
+    try:
+        import importlib.metadata as md
+        info["ccl_chromium_reader_version"] = md.version("ccl_chromium_reader")
+    except Exception:
+        pass
+    try:
+        import ccl_chromium_reader as ccl_module  # type: ignore
+        info["ccl_chromium_reader_module_path"] = getattr(ccl_module, "__file__", None)
+    except Exception:
+        pass
+    return info
+
+def capture_fatal_exception(exc: BaseException, *, out_dir: Optional[Path], errors_path: Optional[Path]) -> int:
+    exc_type = type(exc).__name__
+    exc_msg = str(exc)
+    tb = traceback.format_exc()
+    print(f"{exc_type}: {exc_msg}", file=sys.stderr, flush=True)
+    print(tb, file=sys.stderr, flush=True)
+
+    fatal_path: Optional[Path] = None
+    if out_dir is not None and out_dir.exists():
+        fatal_path = out_dir / "fatal.txt"
+    else:
+        temp_dir = Path(os.getenv("TEMP") or os.getenv("TMPDIR") or tempfile.gettempdir())
+        timestamp = _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        fatal_path = temp_dir / f"ccl_fatal_{timestamp}.txt"
+        print(f"fatal traceback written to: {fatal_path}", file=sys.stderr, flush=True)
+
+    try:
+        write_text(fatal_path, tb)
+    except Exception:
+        pass
+
+    if errors_path is not None:
+        try:
+            evt = {
+                "stage": "fatal",
+                "exc_type": exc_type,
+                "exc": exc_msg,
+                "traceback": tb,
+                "ts": utc_now_iso(),
+            }
+            with errors_path.open("a", encoding="utf-8", errors="replace", newline="\n") as f:
+                f.write(json.dumps(jsonable(evt), ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    return 2
 
 # -----------------------------
 # Smart decode / decompress helpers (foundation)
@@ -2788,6 +2851,7 @@ def main() -> int:
     ap.add_argument("--out", default="", help="Output directory (default: <root>\\ccl_reader_export_<timestamp>).")
     ap.add_argument("--heartbeat", type=int, default=20, help="Heartbeat interval seconds (default: 20).")
     ap.add_argument("--no-verbose", action="store_true", help="Disable console logging (still writes run_log.txt).")
+    ap.add_argument("--self-check", action="store_true", help="Run pre-flight environment check and write <out>/self_check.json.")
 
     ap.add_argument("--export-all-history-tables", action="store_true", help="Also export every History.sqlite table to CSV (can be large).")
 
@@ -2805,6 +2869,11 @@ def main() -> int:
     root = Path(args.root).expanduser()
     out_dir = Path(args.out).resolve() if args.out else (root / f"ccl_reader_export_{_dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
     safe_mkdir(out_dir)
+    global _FATAL_OUT_DIR, _FATAL_ERRORS_PATH
+    _FATAL_OUT_DIR = out_dir
+
+    if args.self_check:
+        write_json(out_dir / "self_check.json", build_self_check())
 
     log_path = out_dir / "run_log.txt"
     logger = Logger(log_path, verbose=(not args.no_verbose))
@@ -2814,6 +2883,7 @@ def main() -> int:
     errors_path = out_dir / "errors.jsonl"
     safe_mkdir(errors_path.parent)
     errors_writer = JsonlWriter(errors_path)
+    _FATAL_ERRORS_PATH = errors_path
 
     manifest: Dict[str, Any] = {
         "run": {
@@ -2856,8 +2926,7 @@ def main() -> int:
                 context={"root": str(root), "message": msg},
                 exc=RuntimeError(msg),
             )
-            # Exit non-zero so this is impossible to miss in the console.
-            return 2
+            raise RuntimeError(msg)
 
         for ud_root in roots:
             root_tag = tag_for_root(ud_root, root)
@@ -2938,7 +3007,7 @@ def main() -> int:
                 prof_entry["exports"]["downloads"] = stage_wrap(
                     "downloads",
                     lambda: export_downloads(profile_obj, prof_dir, prof_out, root_tag, profile_name, logger, errors_writer),
-                    errors_writer,
+                    errors_writer=errors_writer,
                     logger=logger,
                     context={"root_tag": root_tag, "profile_name": profile_name, "profile_dir": str(prof_dir)},
                     default={"exported": False, "reason": "exception"},
@@ -2948,7 +3017,7 @@ def main() -> int:
                 prof_entry["exports"]["local_storage"] = stage_wrap(
                     "local_storage",
                     lambda: export_local_storage(profile_obj, prof_dir, prof_out, root_tag, profile_name, logger, errors_writer),
-                    errors_writer,
+                    errors_writer=errors_writer,
                     logger=logger,
                     context={"root_tag": root_tag, "profile_name": profile_name, "profile_dir": str(prof_dir)},
                     default={"exported": False, "reason": "exception"},
@@ -2958,7 +3027,7 @@ def main() -> int:
                 prof_entry["exports"]["session_storage"] = stage_wrap(
                     "session_storage",
                     lambda: export_session_storage(prof_dir, profile_obj, prof_out, root_tag, profile_name, logger, errors_writer),
-                    errors_writer,
+                    errors_writer=errors_writer,
                     logger=logger,
                     context={"root_tag": root_tag, "profile_name": profile_name, "profile_dir": str(prof_dir)},
                     default={"exported": False, "reason": "exception"},
@@ -3058,4 +3127,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        exit_code = main()
+    except BaseException as exc:
+        exit_code = capture_fatal_exception(exc, out_dir=_FATAL_OUT_DIR, errors_path=_FATAL_ERRORS_PATH)
+    raise SystemExit(exit_code)
