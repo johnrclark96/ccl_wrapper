@@ -268,23 +268,32 @@ def capture_fatal_exception(exc: BaseException, *, out_dir: Optional[Path], erro
     exc_type = type(exc).__name__
     exc_msg = str(exc)
     tb = traceback.format_exc()
-    print(f"{exc_type}: {exc_msg}", file=sys.stderr, flush=True)
+    header = f"{exc_type}: {exc_msg}"
+    fatal_text = f"{header}\n{tb}"
+    print(header, file=sys.stderr, flush=True)
     print(tb, file=sys.stderr, flush=True)
 
     fatal_path: Optional[Path] = None
+    temp_dir = Path(os.getenv("TEMP") or os.getenv("TMPDIR") or tempfile.gettempdir())
+    tz = getattr(_dt, "UTC", _dt.timezone.utc)
+    now = _dt.datetime.now(tz)
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    fallback_path = temp_dir / f"ccl_fatal_{timestamp}_{now.microsecond}_{os.getpid()}.txt"
+
     if out_dir is not None and out_dir.exists():
         fatal_path = out_dir / "fatal.txt"
-    else:
-        temp_dir = Path(os.getenv("TEMP") or os.getenv("TMPDIR") or tempfile.gettempdir())
-        tz = getattr(_dt, "UTC", _dt.timezone.utc)
-        timestamp = _dt.datetime.now(tz).strftime("%Y%m%d_%H%M%S")
-        fatal_path = temp_dir / f"ccl_fatal_{timestamp}.txt"
-        print(f"fatal traceback written to: {fatal_path}", file=sys.stderr, flush=True)
+        try:
+            write_text(fatal_path, fatal_text)
+        except Exception:
+            fatal_path = None
 
-    try:
-        write_text(fatal_path, tb)
-    except Exception:
-        pass
+    if fatal_path is None:
+        try:
+            write_text(fallback_path, fatal_text)
+            fatal_path = fallback_path
+            print(f"fatal traceback written to: {fatal_path}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
     if errors_path is not None:
         try:
@@ -3147,6 +3156,8 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         exit_code = main()
-    except Exception as exc:
+    except KeyboardInterrupt:
+        raise
+    except BaseException as exc:
         exit_code = capture_fatal_exception(exc, out_dir=_FATAL_OUT_DIR, errors_path=_FATAL_ERRORS_PATH)
     raise SystemExit(exit_code)
