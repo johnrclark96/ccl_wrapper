@@ -2847,7 +2847,7 @@ def build_report(out_dir: Path, manifest: Dict[str, Any], logger: Logger) -> Non
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Export Chromium user data using ccl_chromium_reader (max coverage).")
-    ap.add_argument("--root", required=True, help="Path to a Chromium \"User Data\" root folder (the folder containing \"Local State\" and profile folders like \"Default\"). Example: C:\\Users\\<you>\\AppData\\Local\\Google\\Chrome\\User Data  (or your extracted User_Data folder).")
+    ap.add_argument("--root", required=False, help="Path to a Chromium \"User Data\" root folder (the folder containing \"Local State\" and profile folders like \"Default\"). Example: C:\\Users\\<you>\\AppData\\Local\\Google\\Chrome\\User Data  (or your extracted User_Data folder).")
     ap.add_argument("--out", default="", help="Output directory (default: <root>\\ccl_reader_export_<timestamp>).")
     ap.add_argument("--heartbeat", type=int, default=20, help="Heartbeat interval seconds (default: 20).")
     ap.add_argument("--no-verbose", action="store_true", help="Disable console logging (still writes run_log.txt).")
@@ -2866,14 +2866,18 @@ def main() -> int:
 
     args = ap.parse_args()
 
-    root = Path(args.root).expanduser()
-    out_dir = Path(args.out).resolve() if args.out else (root / f"ccl_reader_export_{_dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
+    root = Path(args.root).expanduser() if args.root else None
+    out_dir = Path(args.out).resolve() if args.out else ((root or Path.cwd()) / f"ccl_reader_export_{_dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
     safe_mkdir(out_dir)
     global _FATAL_OUT_DIR, _FATAL_ERRORS_PATH
     _FATAL_OUT_DIR = out_dir
 
     if args.self_check:
         write_json(out_dir / "self_check.json", build_self_check())
+        if root is None:
+            return 0
+    elif root is None:
+        raise SystemExit(2)
 
     log_path = out_dir / "run_log.txt"
     logger = Logger(log_path, verbose=(not args.no_verbose))
