@@ -234,6 +234,15 @@ def jsonable(x: Any) -> Any:
     except Exception:
         return str(x)
 
+def _safe_repr(obj: Any) -> str:
+    try:
+        return repr(obj)
+    except Exception:
+        try:
+            return str(obj)
+        except Exception:
+            return "<unrepr-able>"
+
 
 def write_json(path: Path, obj: Any) -> None:
     """Write JSON with best-effort conversion so exports never fail on bytes/Path/etc."""
@@ -356,18 +365,33 @@ def warn_once(key_parts, message):
     print(f"WARNING: {message}", flush=True)
     return True
 
-def log_error_event(
-    errors_writer: Optional["JsonlWriter"],
+def log_error_event(errors_writer: Optional["SafeJsonlWriter"], evt: Dict[str, Any]) -> None:
+    """Centralized error event logger. Never raises."""
+    try:
+        if "ts" not in evt and "ts_utc" not in evt:
+            evt["ts_utc"] = utc_now_iso()
+    except Exception:
+        evt = {
+            "stage": "error_logging_failed",
+            "ts_utc": utc_now_iso(),
+            "payload_repr": _safe_repr(evt),
+        }
+
+    try:
+        if errors_writer is not None:
+            errors_writer.write_event(evt)
+    except Exception:
+        pass
+
+
+def log_stage_error(
+    errors_writer: Optional["SafeJsonlWriter"],
     logger: Optional["Logger"],
     *,
     stage: str,
     context: Optional[Dict[str, Any]] = None,
     exc: Optional[BaseException] = None,
 ) -> None:
-    """
-    Write a structured error event to errors.jsonl (if available) and emit a one-line WARNING to console.
-    This is the foundation for "no silent stage loss."
-    """
     evt: Dict[str, Any] = {"ts_utc": utc_now_iso(), "stage": stage}
     if context:
         evt.update(context)
@@ -379,16 +403,10 @@ def log_error_event(
         except Exception:
             pass
 
-    try:
-        if errors_writer is not None:
-            errors_writer.write(evt)
-    except Exception:
-        # If errors writing fails, we still want *some* console signal
-        pass
+    log_error_event(errors_writer, evt)
 
     try:
         if logger is not None:
-            # Keep console warning single-line
             msg = f"stage={stage}"
             if exc is not None:
                 msg += f" err={type(exc).__name__}: {exc}"
@@ -401,7 +419,7 @@ def stage_wrap(
     stage: str,
     fn,
     *,
-    errors_writer: Optional["JsonlWriter"],
+    errors_writer: Optional["SafeJsonlWriter"],
     logger: Optional["Logger"],
     context: Optional[Dict[str, Any]] = None,
     default: Optional[Dict[str, Any]] = None,
@@ -415,8 +433,10 @@ def stage_wrap(
         if isinstance(res, dict):
             return res
         return {"exported": True, "result": jsonable(res)}
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
     except Exception as e:
-        log_error_event(errors_writer, logger, stage=stage, context=context, exc=e)
+        log_stage_error(errors_writer, logger, stage=stage, context=context, exc=e)
         if default is not None:
             return default
         return {"exported": False, "error": f"{type(e).__name__}: {e}"}
@@ -610,6 +630,82 @@ class JsonlWriter:
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
+
+
+class SafeJsonlWriter:
+    def __init__(
+        self,
+        out_dir: Path,
+        *,
+        primary_name: str = "errors.jsonl",
+        fallback_name: str = "errors_fallback.jsonl",
+        primary_path: Optional[Path] = None,
+        fallback_path: Optional[Path] = None,
+    ):
+        self.primary_path = primary_path or (out_dir / primary_name)
+        self.fallback_path = fallback_path or (out_dir / fallback_name)
+        try:
+            safe_mkdir(self.primary_path.parent)
+        except Exception:
+            pass
+
+    def _serialize_event(self, evt: Dict[str, Any]) -> str:
+        return json.dumps(jsonable(evt), ensure_ascii=False)
+
+    def _serialize_fallback(self, evt: Any, exc: BaseException) -> str:
+        orig_stage = None
+        try:
+            if isinstance(evt, dict):
+                orig_stage = evt.get("stage")
+        except Exception:
+            orig_stage = None
+        fallback_evt = {
+            "stage": "error_logging_failed",
+            "orig_stage": orig_stage,
+            "exc": f"{type(exc).__name__}: {exc}",
+            "ts_utc": utc_now_iso(),
+            "payload_repr": _safe_repr(evt),
+        }
+        return json.dumps(fallback_evt, ensure_ascii=False)
+
+    def _append_line(self, path: Path, line: str) -> None:
+        try:
+            safe_mkdir(path.parent)
+        except Exception:
+            pass
+        with path.open("a", encoding="utf-8", errors="replace", newline="\n") as f:
+            f.write(line)
+            if not line.endswith("\n"):
+                f.write("\n")
+
+    def write_event(self, evt: Dict[str, Any]) -> None:
+        try:
+            line = self._serialize_event(evt)
+        except Exception as exc:
+            line = self._serialize_fallback(evt, exc)
+
+        try:
+            self._append_line(self.primary_path, line)
+            return
+        except Exception:
+            pass
+
+        try:
+            self._append_line(self.fallback_path, line)
+            return
+        except Exception:
+            pass
+
+        try:
+            print(line, file=sys.stderr, flush=True)
+        except Exception:
+            try:
+                print(_safe_repr(line), file=sys.stderr, flush=True)
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        return
 
 
 class CsvWriter:
@@ -1225,7 +1321,7 @@ def export_profile_files_inventory(
     prof_dir: Path,
     profile_out_dir: Path,
     logger: Logger,
-    errors_writer: Optional[JsonlWriter] = None,
+    errors_writer: Optional[SafeJsonlWriter] = None,
 ) -> Dict[str, Any]:
     """Emit a stat-only inventory of the entire profile folder (no content reads)."""
     out_dir = profile_out_dir / "inventory"
@@ -1252,19 +1348,18 @@ def export_profile_files_inventory(
     def _emit_err(stage: str, path: Path, exc: Exception) -> None:
         nonlocal errs
         errs += 1
-        ev = {
-            "stage": stage,
-            "profile_name": prof_dir.name,
-            "profile_path": str(prof_dir),
-            "path": str(path),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-        if errors_writer is not None:
-            try:
-                errors_writer.write(ev)
-            except Exception:
-                pass
-        logger.warn(f"stage={stage} profile={prof_dir.name} path={path} err={type(exc).__name__}: {exc}")
+        log_stage_error(
+            errors_writer,
+            logger,
+            stage=stage,
+            context={
+                "profile_name": prof_dir.name,
+                "profile_path": str(prof_dir),
+                "path": str(path),
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+            exc=exc,
+        )
 
     try:
         with JsonlWriter(jsonl_path) as jw, CsvWriter(csv_path, fieldnames) as cw:
@@ -1327,7 +1422,7 @@ def export_profile_json_files(
     prof_dir: Path,
     out_dir: Path,
     logger: Logger,
-    errors_writer: Optional[JsonlWriter] = None,
+    errors_writer: Optional[SafeJsonlWriter] = None,
 ) -> Dict[str, Any]:
     """Copy targeted, high-signal JSON/text artifacts for local human review."""
     ensure_dir(out_dir)
@@ -1385,19 +1480,18 @@ def export_profile_json_files(
     def _emit_err(stage: str, src: Path, exc: Exception) -> None:
         nonlocal errs
         errs += 1
-        ev = {
-            "stage": stage,
-            "profile_name": prof_dir.name,
-            "profile_path": str(prof_dir),
-            "src": str(src),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-        if errors_writer is not None:
-            try:
-                errors_writer.write(ev)
-            except Exception:
-                pass
-        logger.warn(f"stage={stage} profile={prof_dir.name} src={src} err={type(exc).__name__}: {exc}")
+        log_stage_error(
+            errors_writer,
+            logger,
+            stage=stage,
+            context={
+                "profile_name": prof_dir.name,
+                "profile_path": str(prof_dir),
+                "src": str(src),
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+            exc=exc,
+        )
 
     try:
         with JsonlWriter(jsonl_path) as jw, CsvWriter(csv_path, fieldnames) as cw:
@@ -1458,7 +1552,7 @@ def export_profile_json_files(
 
 
 def export_downloads(profile_obj: Any, prof_dir: Path, profile_out_dir: Path, root_tag: str, profile_name: str,
-                     logger: Logger, errors_writer: Optional[JsonlWriter]) -> None:
+                     logger: Logger, errors_writer: Optional[SafeJsonlWriter]) -> None:
     """Export downloads with maximum coverage.
 
     Strategy:
@@ -1709,15 +1803,23 @@ def export_downloads(profile_obj: Any, prof_dir: Path, profile_out_dir: Path, ro
                         cw.write_row(row)
                     except Exception as e:
                         # CSV row issues must never kill downloads export
-                        log_error_event(errors_writer, logger, stage="downloads_csv_row_failed",
-                                        context={"root_tag": root_tag, "profile_name": profile_name, "source": source_name},
-                                        exc=e)
+                        log_stage_error(
+                            errors_writer,
+                            logger,
+                            stage="downloads_csv_row_failed",
+                            context={"root_tag": root_tag, "profile_name": profile_name, "source": source_name},
+                            exc=e,
+                        )
                     rows_written += 1
                 iter_ok = True
             except Exception as e:
-                log_error_event(errors_writer, logger, stage="downloads_iterator_failed",
-                                context={"root_tag": root_tag, "profile_name": profile_name, "source": source_name},
-                                exc=e)
+                log_stage_error(
+                    errors_writer,
+                    logger,
+                    stage="downloads_iterator_failed",
+                    context={"root_tag": root_tag, "profile_name": profile_name, "source": source_name},
+                    exc=e,
+                )
             if iter_ok and rows_written > 0:
                 used_source = source_name
                 break
@@ -1725,13 +1827,19 @@ def export_downloads(profile_obj: Any, prof_dir: Path, profile_out_dir: Path, ro
         logger.info(f"[downloads] rows_written={rows_written} source={used_source}")
 
     except Exception as e:
-        log_error_event(errors_writer, logger, stage="downloads", context={"root_tag": root_tag, "profile_name": profile_name}, exc=e)
+        log_stage_error(
+            errors_writer,
+            logger,
+            stage="downloads",
+            context={"root_tag": root_tag, "profile_name": profile_name},
+            exc=e,
+        )
         raise
     finally:
         jw.close()
         cw.close()
 def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path, root_tag: str, profile_name: str,
-                        logger: Logger, errors_writer: Optional[JsonlWriter]) -> None:
+                        logger: Logger, errors_writer: Optional[SafeJsonlWriter]) -> None:
     stage = "local_storage"
     out_dir = ensure_dir(profile_out_dir / stage)
 
@@ -1755,7 +1863,7 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
     try:
         lsdb = LocalStoreDb(ls_dir)
     except Exception as e:
-        log_error_event(
+        log_stage_error(
             errors_writer,
             logger,
             stage=f"{stage}_init_failed",
@@ -1803,7 +1911,7 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
                 rec_iter = lsdb.iter_records_for_storage_key(storage_key, include_deletions=True)
             except KeyError as e:
                 record_errors += 1
-                log_error_event(
+                log_stage_error(
                     errors_writer,
                     logger,
                     stage=f"{stage}_iter_records_failed",
@@ -1813,7 +1921,7 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
                 continue
             except Exception as e:
                 record_errors += 1
-                log_error_event(
+                log_stage_error(
                     errors_writer,
                     logger,
                     stage=f"{stage}_iter_records_failed",
@@ -1892,7 +2000,7 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
                     try:
                         cw.write_row(row)
                     except Exception as e:
-                        log_error_event(
+                        log_stage_error(
                             errors_writer,
                             logger,
                             stage=f"{stage}_csv_row_failed",
@@ -1903,7 +2011,7 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
                     total_records += 1
                 except Exception as e:
                     record_errors += 1
-                    log_error_event(
+                    log_stage_error(
                         errors_writer,
                         logger,
                         stage=f"{stage}_record_failed",
@@ -1922,7 +2030,7 @@ def export_session_storage(
     root_tag: str,
     profile_name: str,
     logger: Logger,
-    errors_writer: Optional[JsonlWriter] = None,
+    errors_writer: Optional[SafeJsonlWriter] = None,
 ) -> Dict[str, Any]:
     """
     Step 2A: Session Storage export using ccl_chromium_reader SessionStoreDb (README pattern).
@@ -1989,7 +2097,7 @@ def export_session_storage(
     try:
         from ccl_chromium_reader import ccl_chromium_sessionstorage as _ccl_ss  # type: ignore
     except Exception as e:
-        log_error_event(
+        log_stage_error(
             errors_writer,
             logger,
             stage=f"{stage}_import_failed",
@@ -2007,7 +2115,7 @@ def export_session_storage(
     try:
         db = _ccl_ss.SessionStoreDb(ss_leveldb_dir)
     except Exception as e:
-        log_error_event(
+        log_stage_error(
             errors_writer,
             logger,
             stage=f"{stage}_open_failed",
@@ -2027,7 +2135,7 @@ def export_session_storage(
                     rec_iter = db.iter_records_for_host(host)
                 except Exception as e:
                     record_errors += 1
-                    log_error_event(
+                    log_stage_error(
                         errors_writer,
                         logger,
                         stage=f"{stage}_iter_records_failed",
@@ -2086,7 +2194,7 @@ def export_session_storage(
                         try:
                             cw.write_row(csv_row)
                         except Exception as e:
-                            log_error_event(
+                            log_stage_error(
                                 errors_writer,
                                 logger,
                                 stage=f"{stage}_csv_row_failed",
@@ -2099,7 +2207,7 @@ def export_session_storage(
                             logger.info(f"[{stage}] exported {exported} record(s) ...")
                     except Exception as e:
                         record_errors += 1
-                        log_error_event(
+                        log_stage_error(
                             errors_writer,
                             logger,
                             stage=f"{stage}_record_failed",
@@ -2109,7 +2217,7 @@ def export_session_storage(
                         continue
 
         except Exception as e:
-            log_error_event(
+            log_stage_error(
                 errors_writer,
                 logger,
                 stage=f"{stage}_iteration_failed",
@@ -2215,45 +2323,16 @@ def _salvage_indexeddb_blob_dir(profile_path, host_id, out_dir, *, root_tag=None
     except Exception as e:
         warn_once(("indexeddb_blob_salvage_failed", str(profile_path), host_id), f"stage=indexeddb_blob_salvage_failed err={type(e).__name__}: {e}")
         if errors_writer is not None:
-            log_error_event(errors_writer, stage="indexeddb_blob_salvage_failed", root_tag=root_tag, profile_name=profile_name, host_id=host_id, err=repr(e))
-        return None
-        dest = Path(out_dir) / "indexeddb" / "blob_fallback" / host_id
-        ensure_dir(dest)
-        inv_jsonl = dest / "blob_inventory.jsonl"
-        inv_csv = dest / "blob_inventory.csv"
-        # bounded copy/inventory (avoid runaway sizes)
-        max_files = 5000
-        max_total_bytes = 2 * 1024 * 1024 * 1024  # 2 GiB cap
-        total_bytes = 0
-        files = 0
-        with JsonlWriter(inv_jsonl) as jw, SafeCsvWriter(inv_csv, fieldnames=["rel_path","size_bytes","mtime_utc","copied_to"]) as cw:
-            for p in blob_dir.rglob("*"):
-                if not p.is_file():
-                    continue
-                rel = str(p.relative_to(blob_dir))
-                st = p.stat()
-                size = int(st.st_size)
-                mtime = datetime.datetime.utcfromtimestamp(st.st_mtime).replace(microsecond=0).isoformat() + "Z"
-                copied_to = ""
-                # copy while under caps
-                if files < max_files and (total_bytes + size) <= max_total_bytes:
-                    dest_path = dest / rel
-                    ensure_dir(dest_path.parent)
-                    try:
-                        shutil.copy2(p, dest_path)
-                        copied_to = str(dest_path)
-                        total_bytes += size
-                    except Exception:
-                        copied_to = ""
-                row={"rel_path": rel, "size_bytes": size, "mtime_utc": mtime, "copied_to": copied_to}
-                jw.write({"root_tag": root_tag, "profile_name": profile_name, "host_id": host_id, **row})
-                cw.writerow(row)
-                files += 1
-        return str(dest)
-    except Exception as e:
-        warn_once(("indexeddb_blob_salvage_failed", root_tag, profile_name, host_id), f"stage=indexeddb_blob_salvage_failed err={type(e).__name__}: {e}")
-        if errors_writer is not None:
-            log_error_event(errors_writer, stage="indexeddb_blob_salvage_failed", root_tag=root_tag, profile_name=profile_name, host_id=host_id, err=repr(e))
+            log_error_event(
+                errors_writer,
+                {
+                    "stage": "indexeddb_blob_salvage_failed",
+                    "root_tag": root_tag,
+                    "profile_name": profile_name,
+                    "host_id": host_id,
+                    "err": repr(e),
+                },
+            )
         return None
 
 def export_indexeddb(
@@ -2907,10 +2986,8 @@ def main() -> int:
     hb = Heartbeat(logger, args.heartbeat)
     hb.start()
 
-    errors_path = out_dir / "errors.jsonl"
-    safe_mkdir(errors_path.parent)
-    errors_writer = JsonlWriter(errors_path)
-    _FATAL_ERRORS_PATH = errors_path
+    errors_writer = SafeJsonlWriter(out_dir)
+    _FATAL_ERRORS_PATH = errors_writer.primary_path
 
     manifest: Dict[str, Any] = {
         "run": {
@@ -2936,7 +3013,7 @@ def main() -> int:
         from ccl_chromium_reader.ccl_chromium_profile_folder import ChromiumProfileFolder
     except Exception as e:
         logger.info(f"FATAL: could not import ccl_chromium_reader: {e}")
-        errors_writer.write({"fatal": True, "error": str(e)})
+        log_error_event(errors_writer, {"fatal": True, "error": str(e)})
         errors_writer.close()
         hb.stop()
         return 2
@@ -2946,7 +3023,7 @@ def main() -> int:
         if not roots:
             msg = f"No Chromium user-data roots discovered under: {root!s}"
             logger.error("FATAL: " + msg)
-            log_error_event(
+            log_stage_error(
                 errors_writer,
                 logger,
                 stage="root_discovery",
@@ -2972,7 +3049,13 @@ def main() -> int:
             try:
                 root_entry["exports"]["root_files"] = export_root_artifacts(ud_root, root_out, logger)
             except Exception as e:
-                errors_writer.write({"root": str(ud_root), "stage": "root_files", "error": str(e)}); logger.warn(f"stage=root_files root_tag={root_tag} root={ud_root} err={type(e).__name__}: {e}")
+                log_stage_error(
+                    errors_writer,
+                    logger,
+                    stage="root_files",
+                    context={"root": str(ud_root), "root_tag": root_tag, "error": str(e)},
+                    exc=e,
+                )
                 root_entry["exports"]["root_files_error"] = str(e)
 
             profiles = discover_profile_dirs(ud_root, logger)
@@ -2994,12 +3077,24 @@ def main() -> int:
                 try:
                     prof_entry["exports"]["inventory"] = export_profile_files_inventory(prof_dir, prof_out, logger, errors_writer)
                 except Exception as e:
-                    errors_writer.write({"profile": str(prof_dir), "stage": "inventory", "error": str(e)}); logger.warn(f"stage=inventory profile={profile_name} path={prof_dir} err={type(e).__name__}: {e}")
+                    log_stage_error(
+                        errors_writer,
+                        logger,
+                        stage="inventory",
+                        context={"profile": str(prof_dir), "profile_name": profile_name, "error": str(e)},
+                        exc=e,
+                    )
 
                 try:
                     prof_entry["exports"]["json_files"] = export_profile_json_files(prof_dir, prof_out / "json", logger, errors_writer)
                 except Exception as e:
-                    errors_writer.write({"profile": str(prof_dir), "stage": "json_files", "error": str(e)}); logger.warn(f"stage=json_files profile={profile_name} path={prof_dir} err={type(e).__name__}: {e}")
+                    log_stage_error(
+                        errors_writer,
+                        logger,
+                        stage="json_files",
+                        context={"profile": str(prof_dir), "profile_name": profile_name, "error": str(e)},
+                        exc=e,
+                    )
 
                 # ccl high-level profile object
                 try:
@@ -3014,7 +3109,13 @@ def main() -> int:
 
                     profile_obj = ChromiumProfileFolder(prof_dir, cache_folder=cache_folder)
                 except Exception as e:
-                    errors_writer.write({"profile": str(prof_dir), "stage": "ChromiumProfileFolder", "error": str(e)}); logger.warn(f"stage=ChromiumProfileFolder profile={profile_name} path={prof_dir} err={type(e).__name__}: {e}")
+                    log_stage_error(
+                        errors_writer,
+                        logger,
+                        stage="ChromiumProfileFolder",
+                        context={"profile": str(prof_dir), "profile_name": profile_name, "error": str(e)},
+                        exc=e,
+                    )
                     prof_entry["exports"]["profile_open_error"] = str(e)
                     root_entry["profiles"].append(prof_entry)
                     continue
@@ -3029,7 +3130,13 @@ def main() -> int:
                     else:
                         prof_entry["exports"]["history"] = {"exported": False, "reason": "missing History file"}
                 except Exception as e:
-                    errors_writer.write({"profile": str(prof_dir), "stage": "history", "error": str(e)})
+                    log_stage_error(
+                        errors_writer,
+                        logger,
+                        stage="history",
+                        context={"profile": str(prof_dir), "profile_name": profile_name, "error": str(e)},
+                        exc=e,
+                    )
                 # Downloads (prefer shared_proto_db support when available)
                 prof_entry["exports"]["downloads"] = stage_wrap(
                     "downloads",
@@ -3071,7 +3178,13 @@ def main() -> int:
                         blob_max_bytes=args.indexeddb_blob_max_bytes,
                     )
                 except Exception as e:
-                    errors_writer.write({"profile": str(prof_dir), "stage": "indexeddb", "error": str(e)})
+                    log_stage_error(
+                        errors_writer,
+                        logger,
+                        stage="indexeddb",
+                        context={"profile": str(prof_dir), "profile_name": profile_name, "error": str(e)},
+                        exc=e,
+                    )
 
                 # Cache
 
@@ -3096,13 +3209,25 @@ def main() -> int:
 
                 except Exception as e:
 
-                    errors_writer.write({"profile": str(prof_dir), "stage": "cache", "error": str(e)})
+                    log_stage_error(
+                        errors_writer,
+                        logger,
+                        stage="cache",
+                        context={"profile": str(prof_dir), "profile_name": profile_name, "error": str(e)},
+                        exc=e,
+                    )
 
                 # Notifications
                 try:
                     prof_entry["exports"]["notifications"] = export_notifications(prof_dir, prof_out / "notifications", logger)
                 except Exception as e:
-                    errors_writer.write({"profile": str(prof_dir), "stage": "notifications", "error": str(e)})
+                    log_stage_error(
+                        errors_writer,
+                        logger,
+                        stage="notifications",
+                        context={"profile": str(prof_dir), "profile_name": profile_name, "error": str(e)},
+                        exc=e,
+                    )
 
                 # File System API
                 try:
@@ -3114,13 +3239,25 @@ def main() -> int:
                         copy_max_total_bytes=args.filesystem_copy_max_total_bytes,
                     )
                 except Exception as e:
-                    errors_writer.write({"profile": str(prof_dir), "stage": "filesystem", "error": str(e)})
+                    log_stage_error(
+                        errors_writer,
+                        logger,
+                        stage="filesystem",
+                        context={"profile": str(prof_dir), "profile_name": profile_name, "error": str(e)},
+                        exc=e,
+                    )
 
                 # Session restore (SNSS2)
                 try:
                     prof_entry["exports"]["snss2"] = export_snss_sessions(prof_dir, prof_out / "snss2", logger)
                 except Exception as e:
-                    errors_writer.write({"profile": str(prof_dir), "stage": "snss2", "error": str(e)})
+                    log_stage_error(
+                        errors_writer,
+                        logger,
+                        stage="snss2",
+                        context={"profile": str(prof_dir), "profile_name": profile_name, "error": str(e)},
+                        exc=e,
+                    )
 
                 # Close profile store resources if it supports it
                 try:
