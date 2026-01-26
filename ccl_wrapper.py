@@ -1792,6 +1792,16 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
 
             try:
                 rec_iter = lsdb.iter_records_for_storage_key(storage_key, include_deletions=True)
+            except KeyError as e:
+                record_errors += 1
+                log_error_event(
+                    errors_writer,
+                    logger,
+                    stage=f"{stage}_iter_records_failed",
+                    context={"root_tag": root_tag, "profile_name": profile_name, "storage_key": storage_key_str},
+                    exc=e,
+                )
+                continue
             except Exception as e:
                 record_errors += 1
                 log_error_event(
@@ -2881,7 +2891,7 @@ def main() -> int:
         if root is None:
             return 0
     elif root is None:
-        raise SystemExit(2)
+        return 2
 
     log_path = out_dir / "run_log.txt"
     logger = Logger(log_path, verbose=(not args.no_verbose))
@@ -3137,6 +3147,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         exit_code = main()
-    except BaseException as exc:
+    except Exception as exc:
         exit_code = capture_fatal_exception(exc, out_dir=_FATAL_OUT_DIR, errors_path=_FATAL_ERRORS_PATH)
     raise SystemExit(exit_code)
