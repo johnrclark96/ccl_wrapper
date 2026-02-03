@@ -71,6 +71,11 @@ except Exception:
 _FATAL_OUT_DIR: Optional[Path] = None
 _FATAL_ERRORS_PATH: Optional[Path] = None
 
+MAX_INPUT_BYTES = 50 * 1024 * 1024
+MAX_DECODED_BYTES = 5 * 1024 * 1024
+MAX_DECODE_DEPTH = 3
+MAX_SNAPPY_INPUT_BYTES = 2 * 1024 * 1024
+
 def utc_now_iso() -> str:
     tz = getattr(_dt, "UTC", _dt.timezone.utc)
     return _dt.datetime.now(tz).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -233,6 +238,28 @@ def jsonable(x: Any) -> Any:
         return str(x)
     except Exception:
         return str(x)
+
+def bounded_b64(data: Optional[Union[bytes, bytearray, memoryview]], *, max_bytes: int = 262_144) -> Dict[str, Any]:
+    if data is None:
+        return {"b64": "", "truncated": False, "raw_len": 0}
+    b = data.tobytes() if isinstance(data, memoryview) else bytes(data)
+    full_len = len(b)
+    truncated = full_len > max_bytes
+    if truncated:
+        b = b[:max_bytes]
+    return {"b64": base64.b64encode(b).decode("ascii"), "truncated": truncated, "raw_len": full_len}
+
+
+def compact_bytes_json(data: Union[bytes, bytearray, memoryview], *, max_preview_bytes: int = 16 * 1024) -> Dict[str, Any]:
+    b = data.tobytes() if isinstance(data, memoryview) else bytes(data)
+    preview = b[:max_preview_bytes]
+    return {
+        "_kind": "bytes",
+        "len": len(b),
+        "sha256": hashlib.sha256(b).hexdigest(),
+        "b64_preview": base64.b64encode(preview).decode("ascii"),
+        "preview_truncated": len(b) > len(preview),
+    }
 
 def _safe_repr(obj: Any) -> str:
     try:
@@ -415,6 +442,181 @@ def log_stage_error(
         pass
 
 
+def should_decode_utf16le(value_bytes: bytes) -> bool:
+    if value_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return True
+    if len(value_bytes) % 2 != 0:
+        return False
+    nul_ratio = value_bytes.count(b"\x00") / max(1, len(value_bytes))
+    return nul_ratio > 0.20
+
+
+def _wrap_leveldb_iterator(db_obj: Any, iterator: Iterator[Any]) -> Iterator[Any]:
+    try:
+        yield from iterator
+    finally:
+        close_fn = getattr(db_obj, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+
+def _iter_leveldb_raw_records(leveldb_dir: Path) -> Tuple[Optional[Iterator[Any]], Dict[str, Any]]:
+    meta = {"raw_leveldb_used": "", "raw_leveldb_error": ""}
+    try:
+        from storage_formats.ccl_leveldb import RawLevelDb  # type: ignore
+    except Exception:
+        RawLevelDb = None  # type: ignore
+
+    if RawLevelDb is not None:
+        try:
+            raw_db = RawLevelDb(leveldb_dir)
+            meta["raw_leveldb_used"] = "preferred"
+            return _wrap_leveldb_iterator(raw_db, raw_db.iter_records()), meta
+        except Exception as exc:
+            meta["raw_leveldb_error"] = repr(exc)
+
+    try:
+        from ccl_chromium_reader import ccl_chromium_leveldb as _ccl_ldb  # type: ignore
+    except Exception:
+        return None, meta
+    candidates = ["LevelDB", "LevelDb", "LevelDBReader", "LevelDbReader"]
+    db_obj = None
+    for name in candidates:
+        cls = getattr(_ccl_ldb, name, None)
+        if cls is None:
+            continue
+        try:
+            db_obj = cls(leveldb_dir)
+            break
+        except Exception:
+            db_obj = None
+            continue
+    if db_obj is None:
+        return None, meta
+    methods = ["iterate_records", "iter_records", "iterate_raw_records", "iter_records_raw"]
+    for meth in methods:
+        fn = getattr(db_obj, meth, None)
+        if fn is None:
+            continue
+        try:
+            sig = inspect.signature(fn)
+            kwargs = {}
+            if "include_deletions" in sig.parameters:
+                kwargs["include_deletions"] = True
+            meta["raw_leveldb_used"] = "fallback_ccl"
+            iterator = fn(**kwargs) if kwargs else fn()
+            return _wrap_leveldb_iterator(db_obj, iterator), meta
+        except Exception:
+            continue
+    return None, meta
+
+
+def export_leveldb_raw(
+    leveldb_dir: Path,
+    out_path: Path,
+    *,
+    origin: str,
+    root_tag: str,
+    profile_name: str,
+    logger: "Logger",
+    errors_writer: Optional["SafeJsonlWriter"],
+    stage: str,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "exported": False,
+        "raw_leveldb_used": "",
+        "raw_leveldb_error": "",
+    }
+    iterator, meta = _iter_leveldb_raw_records(leveldb_dir)
+    result.update(meta)
+    if iterator is None:
+        result.update({
+            "root_tag": root_tag,
+            "profile_name": profile_name,
+            "origin": origin,
+            "leveldb_dir": str(leveldb_dir),
+            "reason": "raw_leveldb_api_missing",
+        })
+
+    max_records = 200_000
+    max_total_bytes = 100 * 1024 * 1024
+    total_bytes = 0
+    written = 0
+    hit_max_records = False
+    hit_max_total_bytes = False
+    with JsonlWriter(out_path) as jw:
+        if iterator is None:
+            jw.write(result)
+            return result
+        try:
+            for rec in iterator:
+                if written >= max_records:
+                    hit_max_records = True
+                    break
+                key = None
+                value = None
+                if isinstance(rec, (list, tuple)) and len(rec) >= 2:
+                    key, value = rec[0], rec[1]
+                else:
+                    key = getattr(rec, "key", None) or getattr(rec, "raw_key", None)
+                    value = getattr(rec, "value", None) or getattr(rec, "raw_value", None)
+                key_info = bounded_b64(key)
+                val_info = bounded_b64(value)
+                approx_bytes = key_info["raw_len"] + val_info["raw_len"]
+                if total_bytes + approx_bytes > max_total_bytes:
+                    hit_max_total_bytes = True
+                    break
+                total_bytes += approx_bytes
+                seq = (
+                    getattr(rec, "sequence_number", None)
+                    or getattr(rec, "leveldb_seq_number", None)
+                    or getattr(rec, "seq", None)
+                )
+                origin_file = str(getattr(rec, "origin_file", "") or "")
+                row = {
+                    "root_tag": root_tag,
+                    "profile_name": profile_name,
+                    "origin": origin,
+                    "leveldb_dir": str(leveldb_dir),
+                    "seq_or_offset": seq if seq is not None else "",
+                    "origin_file": origin_file,
+                    "key_b64": key_info["b64"],
+                    "key_b64_truncated": key_info["truncated"],
+                    "key_raw_len": key_info["raw_len"],
+                    "value_b64": val_info["b64"],
+                    "value_b64_truncated": val_info["truncated"],
+                    "value_raw_len": val_info["raw_len"],
+                }
+                jw.write(row)
+                written += 1
+            result["exported"] = True
+        except Exception as e:
+            result["raw_leveldb_error"] = result["raw_leveldb_error"] or repr(e)
+            log_stage_error(
+                errors_writer,
+                logger,
+                stage=stage,
+                context={
+                    "root_tag": root_tag,
+                    "profile_name": profile_name,
+                    "origin": origin,
+                    "leveldb_dir": str(leveldb_dir),
+                },
+                exc=e,
+            )
+        result.update({
+            "records_written": written,
+            "total_raw_len_bytes_seen": total_bytes,
+            "hit_max_records": hit_max_records,
+            "hit_max_total_bytes": hit_max_total_bytes,
+        })
+        jw.write(result)
+    return result
+
+
 def stage_wrap(
     stage: str,
     fn,
@@ -442,6 +644,159 @@ def stage_wrap(
         return {"exported": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def _decode_bytes_pipeline(
+    data: bytes,
+    *,
+    max_input_bytes: int,
+    max_decoded_bytes: int,
+    max_depth: int,
+    depth: int = 0,
+    allow_base64: bool = True,
+) -> Dict[str, Any]:
+    """Decode/decompress bytes with strict input/output caps."""
+    if depth >= max_depth:
+        return {
+            "decoded_bytes": data[:max_decoded_bytes],
+            "decoded_encoding": "",
+            "transform_chain": [],
+            "was_truncated": len(data) > max_decoded_bytes,
+            "error": "max_decode_depth",
+        }
+
+    if len(data) > max_input_bytes:
+        data = data[:max_input_bytes]
+
+    def _clip_output(out: bytes) -> Tuple[bytes, bool]:
+        if len(out) > max_decoded_bytes:
+            return out[:max_decoded_bytes], True
+        return out, False
+
+    def _chain_result(transform: str, decoded: bytes, *, truncated: bool) -> Dict[str, Any]:
+        res = _decode_bytes_pipeline(
+            decoded,
+            max_input_bytes=max_input_bytes,
+            max_decoded_bytes=max_decoded_bytes,
+            max_depth=max_depth,
+            depth=depth + 1,
+            allow_base64=allow_base64,
+        )
+        res["transform_chain"] = [transform] + res.get("transform_chain", [])
+        res["was_truncated"] = res.get("was_truncated", False) or truncated
+        return res
+
+    # Base64
+    if allow_base64:
+        try:
+            candidate = b"".join(data.split())
+            if len(candidate) >= 16 and len(candidate) % 4 == 0:
+                s = candidate.decode("ascii")
+                if re.fullmatch(r"[A-Za-z0-9+/=]+", s):
+                    try:
+                        decoded = base64.b64decode(s, validate=True)
+                    except Exception:
+                        decoded = None
+                    if decoded is not None:
+                        return _chain_result("base64", decoded, truncated=False)
+        except Exception:
+            pass
+
+    # gzip
+    if data[:2] == b"\x1f\x8b":
+        try:
+            with io.BytesIO(data) as bio:
+                with __import__("gzip").GzipFile(fileobj=bio) as gz:
+                    out = gz.read(max_decoded_bytes + 1)
+            out, truncated = _clip_output(out)
+            return _chain_result("gzip", out, truncated=truncated)
+        except Exception as e:
+            return {
+                "decoded_bytes": b"",
+                "decoded_encoding": "",
+                "transform_chain": ["gzip"],
+                "was_truncated": False,
+                "error": f"gzip_failed: {type(e).__name__}: {e}",
+            }
+
+    # zlib/deflate
+    if len(data) >= 2 and data[0] == 0x78 and data[1] in (0x01, 0x9C, 0xDA):
+        try:
+            import zlib
+            decomp = zlib.decompressobj()
+            out = decomp.decompress(data, max_decoded_bytes + 1)
+            out, truncated = _clip_output(out)
+            return _chain_result("zlib", out, truncated=truncated)
+        except Exception as e:
+            return {
+                "decoded_bytes": b"",
+                "decoded_encoding": "",
+                "transform_chain": ["zlib"],
+                "was_truncated": False,
+                "error": f"zlib_failed: {type(e).__name__}: {e}",
+            }
+
+    # brotli
+    try:
+        import brotli
+        if len(data) <= max_input_bytes:
+            try:
+                dec = brotli.Decompressor()
+                out_chunks = []
+                total = 0
+                for i in range(0, len(data), 64 * 1024):
+                    chunk = data[i:i + 64 * 1024]
+                    out = dec.process(chunk)
+                    if out:
+                        total += len(out)
+                        if total > max_decoded_bytes:
+                            out_chunks.append(out[: max_decoded_bytes - (total - len(out))])
+                            return _chain_result("brotli", b"".join(out_chunks), truncated=True)
+                        out_chunks.append(out)
+                if out_chunks:
+                    return _chain_result("brotli", b"".join(out_chunks), truncated=False)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # snappy (only when input is small)
+    try:
+        import snappy  # type: ignore
+        if len(data) <= MAX_SNAPPY_INPUT_BYTES:
+            try:
+                out = snappy.decompress(data)
+                out, truncated = _clip_output(out)
+                return _chain_result("snappy", out, truncated=truncated)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if data[:2] == b"PK":
+        return {
+            "decoded_bytes": data[:max_decoded_bytes],
+            "decoded_encoding": "",
+            "transform_chain": ["zip_detected"],
+            "was_truncated": len(data) > max_decoded_bytes,
+            "error": "zip_detected",
+        }
+
+    return {
+        "decoded_bytes": data[:max_decoded_bytes],
+        "decoded_encoding": "",
+        "transform_chain": [],
+        "was_truncated": len(data) > max_decoded_bytes,
+        "error": "",
+    }
+
+
+def _finalize_decode_info(info: Dict[str, Any]) -> Dict[str, Any]:
+    info["b64_preview"] = info.get("raw_b64_preview") or ""
+    info["extracted_files_count"] = len(info.get("extracted_files") or [])
+    info["first_extracted_file"] = (info.get("extracted_files") or [""])[0]
+    info.setdefault("decoded_encoding", "")
+    return info
+
+
 def smart_decode_payload(
     payload: Any,
     *,
@@ -456,7 +811,9 @@ def smart_decode_payload(
     Step 2/3 will integrate this into exporters.
     """
     lim = {
-        "max_bytes_to_process": 50_000_000,
+        "max_bytes_to_process": MAX_INPUT_BYTES,
+        "max_decoded_bytes": MAX_DECODED_BYTES,
+        "max_decode_depth": MAX_DECODE_DEPTH,
         "max_text_chars": 200_000,
         "max_json_chars": 2_000_000,
         "payloads_dir_name": "payloads",
@@ -469,10 +826,14 @@ def smart_decode_payload(
         "kind": None,
         "raw_len": None,
         "decoded_len": None,
+        "decoded_encoding": "",
         "transform_chain": [],
         "text_preview": None,
         "json_preview": None,
         "extracted_files": [],
+        "raw_b64_preview": None,
+        "raw_b64_truncated": None,
+        "was_truncated": False,
         "notes": [],
         "errors": [],
     }
@@ -481,7 +842,7 @@ def smart_decode_payload(
         _ = context
         if payload is None:
             info["kind"] = "none"
-            return info
+            return _finalize_decode_info(info)
 
         if isinstance(payload, str):
             info["kind"] = "str"
@@ -498,7 +859,42 @@ def smart_decode_payload(
                     info["json_preview"] = json.dumps(obj, ensure_ascii=False)[: lim["max_text_chars"]]
                 except Exception:
                     pass
-            return info
+            # Try base64 decode for string payloads, then re-run pipeline
+            try:
+                candidate = re.sub(r"\s+", "", payload)
+                max_b64_chars = (lim["max_bytes_to_process"] * 4) // 3 + 8
+                if len(candidate) > max_b64_chars:
+                    info["notes"].append("base64_skipped_too_large")
+                elif len(candidate) >= 16 and len(candidate) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/=]+", candidate):
+                    try:
+                        decoded = base64.b64decode(candidate, validate=True)
+                    except Exception:
+                        decoded = None
+                    if decoded is not None:
+                        res = _decode_bytes_pipeline(
+                            decoded,
+                            max_input_bytes=lim["max_bytes_to_process"],
+                            max_decoded_bytes=lim["max_decoded_bytes"],
+                            max_depth=lim["max_decode_depth"],
+                            allow_base64=False,
+                        )
+                        info["transform_chain"] = ["base64"] + res["transform_chain"]
+                        data = res["decoded_bytes"]
+                        info["decoded_len"] = len(data)
+                        info["was_truncated"] = res["was_truncated"]
+                        if res.get("error"):
+                            info["errors"].append(res["error"])
+                        preview = best_effort_text(data, max_len=lim["max_text_chars"])
+                        info["text_preview"] = preview
+                        if preview and preview.lstrip()[:1] in "{[" and len(preview) <= lim["max_json_chars"]:
+                            try:
+                                obj = json.loads(preview)
+                                info["json_preview"] = json.dumps(obj, ensure_ascii=False)[: lim["max_text_chars"]]
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            return _finalize_decode_info(info)
 
         # Normalize bytes-like
         b: Optional[bytes] = None
@@ -513,16 +909,23 @@ def smart_decode_payload(
             s = json.dumps(jsonable(payload), ensure_ascii=False)
             info["raw_len"] = len(s)
             info["json_preview"] = s[: lim["max_text_chars"]] + ("…[truncated]" if len(s) > lim["max_text_chars"] else "")
-            return info
+            return _finalize_decode_info(info)
         else:
             info["kind"] = type(payload).__name__
             s = str(payload)
             info["raw_len"] = len(s)
             info["text_preview"] = s[: lim["max_text_chars"]] + ("…[truncated]" if len(s) > lim["max_text_chars"] else "")
-            return info
+            return _finalize_decode_info(info)
 
         info["kind"] = "bytes"
         info["raw_len"] = len(b)
+        try:
+            max_preview_bytes = 64 * 1024
+            raw_preview = b[:max_preview_bytes]
+            info["raw_b64_preview"] = base64.b64encode(raw_preview).decode("ascii")
+            info["raw_b64_truncated"] = len(b) > len(raw_preview)
+        except Exception:
+            pass
 
         # Bound processing
         if len(b) > lim["max_bytes_to_process"]:
@@ -545,22 +948,18 @@ def smart_decode_payload(
             except Exception as e:
                 info["errors"].append(f"write_raw_failed: {type(e).__name__}: {e}")
 
-        # Attempt simple decompress by magic bytes (gzip, zlib-ish, zip)
-        data = b
-        try:
-            import gzip, zlib, zipfile  # stdlib
-            if data[:2] == b"\x1f\x8b":
-                info["transform_chain"].append("gzip")
-                data = gzip.decompress(data)
-            elif len(data) >= 2 and data[0] == 0x78 and data[1] in (0x01, 0x9C, 0xDA):
-                info["transform_chain"].append("zlib")
-                data = zlib.decompress(data)
-            elif data[:2] == b"PK":
-                info["transform_chain"].append("zip_detected")
-                # For Step 1, we won't auto-extract members yet; just note.
-                info["notes"].append("zip_detected_not_extracted_step1")
-        except Exception as e:
-            info["errors"].append(f"decompress_failed: {type(e).__name__}: {e}")
+        res = _decode_bytes_pipeline(
+            b,
+            max_input_bytes=lim["max_bytes_to_process"],
+            max_decoded_bytes=lim["max_decoded_bytes"],
+            max_depth=lim["max_decode_depth"],
+            allow_base64=False,
+        )
+        info["transform_chain"] = res["transform_chain"]
+        info["was_truncated"] = res["was_truncated"]
+        if res.get("error"):
+            info["errors"].append(res["error"])
+        data = res["decoded_bytes"]
 
         info["decoded_len"] = len(data) if isinstance(data, (bytes, bytearray)) else None
 
@@ -592,12 +991,12 @@ def smart_decode_payload(
         except Exception:
             pass
 
-        return info
+        return _finalize_decode_info(info)
 
     except Exception as e:
         # Never raise; return minimal failure info
         info["errors"].append(f"smart_decode_failed: {type(e).__name__}: {e}")
-        return info
+        return _finalize_decode_info(info)
 
 
 class JsonlWriter:
@@ -1838,8 +2237,12 @@ def export_downloads(profile_obj: Any, prof_dir: Path, profile_out_dir: Path, ro
     finally:
         jw.close()
         cw.close()
+def filter_csv_row(row: Dict[str, Any], fieldnames: List[str]) -> Dict[str, Any]:
+    return {key: row.get(key, "") for key in fieldnames}
+
+
 def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path, root_tag: str, profile_name: str,
-                        logger: Logger, errors_writer: Optional[SafeJsonlWriter]) -> None:
+                        logger: Logger, errors_writer: Optional[SafeJsonlWriter]) -> Dict[str, Any]:
     stage = "local_storage"
     out_dir = ensure_dir(profile_out_dir / stage)
 
@@ -1852,13 +2255,15 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
     total_records = 0
     storage_key_count = 0
     record_errors = 0
+    meta_by_storage_key: Dict[str, Dict[str, Any]] = {}
+    decode_stats = {"records": 0, "text_preview": 0, "json_preview": 0, "binary_only": 0, "errors": 0}
 
     from ccl_chromium_reader.ccl_chromium_localstorage import LocalStoreDb  # type: ignore
 
     ls_dir = prof_dir / "Local Storage" / "leveldb"
     if not ls_dir.exists():
         logger.warn(f"[{stage}] missing directory: {ls_dir}")
-        return
+        return {"exported": False, "reason": "missing_local_storage_leveldb", "ls_dir": str(ls_dir)}
 
     try:
         lsdb = LocalStoreDb(ls_dir)
@@ -1870,7 +2275,7 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
             context={"root_tag": root_tag, "profile_name": profile_name, "ls_dir": str(ls_dir)},
             exc=e,
         )
-        return
+        return {"exported": False, "reason": "localstore_init_failed", "ls_dir": str(ls_dir), "error": str(e)}
 
     # Feature-detect include_deletions support on iter_storage_keys.
     try:
@@ -1881,6 +2286,45 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
             storage_keys_iter = lsdb.iter_storage_keys()
     except Exception:
         storage_keys_iter = lsdb.iter_storage_keys()
+
+    def _parse_varint(buf: bytes, offset: int) -> Tuple[int, int]:
+        result = 0
+        shift = 0
+        i = offset
+        while i < len(buf):
+            b = buf[i]
+            result |= (b & 0x7F) << shift
+            i += 1
+            if not (b & 0x80):
+                return result, i
+            shift += 7
+        return result, i
+
+    def _parse_localstorage_meta(value_bytes: bytes) -> Dict[str, Any]:
+        meta: Dict[str, Any] = {"meta_batch_timestamp_utc": "", "meta_batch_size_bytes": ""}
+        i = 0
+        try:
+            while i < len(value_bytes):
+                key, i = _parse_varint(value_bytes, i)
+                field_num = key >> 3
+                wire_type = key & 0x07
+                if wire_type == 0:  # varint
+                    val, i = _parse_varint(value_bytes, i)
+                    if field_num == 1:
+                        # microseconds since 1601-01-01
+                        base = _dt.datetime(1601, 1, 1, tzinfo=_dt.timezone.utc)
+                        ts = base + _dt.timedelta(microseconds=val)
+                        meta["meta_batch_timestamp_utc"] = ts.isoformat().replace("+00:00", "Z")
+                    elif field_num == 2:
+                        meta["meta_batch_size_bytes"] = val
+                elif wire_type == 2:  # length-delimited
+                    length, i = _parse_varint(value_bytes, i)
+                    i += length
+                else:
+                    break
+        except Exception:
+            return meta
+        return meta
 
     with JsonlWriter(jsonl_path) as jw, CsvWriter(
         csv_path,
@@ -1900,6 +2344,9 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
             "b64_preview",
             "extracted_files_count",
             "first_extracted_file",
+            "decoded_encoding",
+            "meta_batch_timestamp_utc",
+            "meta_batch_size_bytes",
         ],
     ) as cw:
         for storage_key in storage_keys_iter:
@@ -1977,6 +2424,32 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
                         },
                         payload_subdir=f"{storage_key_slug}",
                     )
+                    decoded_encoding = ""
+                    if isinstance(value, (bytes, bytearray, memoryview)) and len(value) > 0:
+                        raw_value = bytes(value)
+                        if raw_value[:1] == b"\x00":
+                            try:
+                                text = raw_value[1:].decode("utf-16-le", errors="replace")
+                                decoded["text_preview"] = text[:200_000]
+                                decoded["decoded_len"] = len(raw_value) - 1
+                                decoded_encoding = "utf-16-le"
+                                decoded["decoded_encoding"] = decoded_encoding
+                            except Exception:
+                                decoded["errors"].append("utf16le_decode_failed")
+                        elif raw_value[:1] == b"\x01":
+                            try:
+                                text = raw_value[1:].decode("latin-1", errors="replace")
+                                decoded["text_preview"] = text[:200_000]
+                                decoded["decoded_len"] = len(raw_value) - 1
+                                decoded_encoding = "latin-1"
+                                decoded["decoded_encoding"] = decoded_encoding
+                            except Exception:
+                                decoded["errors"].append("latin1_decode_failed")
+
+                    meta = {}
+                    if isinstance(script_key, str) and script_key.startswith("META:") and isinstance(value, (bytes, bytearray, memoryview)):
+                        meta = _parse_localstorage_meta(bytes(value))
+                        meta_by_storage_key[storage_key_str] = meta
 
                     row = {
                         "root_tag": root_tag,
@@ -1994,6 +2467,9 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
                         "b64_preview": decoded.get("b64_preview"),
                         "extracted_files_count": decoded.get("extracted_files_count"),
                         "first_extracted_file": decoded.get("first_extracted_file"),
+                        "decoded_encoding": decoded_encoding,
+                        "meta_batch_timestamp_utc": meta_by_storage_key.get(storage_key_str, {}).get("meta_batch_timestamp_utc", ""),
+                        "meta_batch_size_bytes": meta_by_storage_key.get(storage_key_str, {}).get("meta_batch_size_bytes", ""),
                     }
 
                     jw.write({"row": row, "decoded": decoded})
@@ -2009,8 +2485,16 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
                         )
 
                     total_records += 1
+                    decode_stats["records"] += 1
+                    if decoded.get("json_preview"):
+                        decode_stats["json_preview"] += 1
+                    elif decoded.get("text_preview"):
+                        decode_stats["text_preview"] += 1
+                    else:
+                        decode_stats["binary_only"] += 1
                 except Exception as e:
                     record_errors += 1
+                    decode_stats["errors"] += 1
                     log_stage_error(
                         errors_writer,
                         logger,
@@ -2023,6 +2507,34 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
         f"[{stage}] storage_keys={storage_key_count} records={total_records} record_errors={record_errors} "
         f"out={out_dir}"
     )
+    try:
+        raw_path = out_dir / "local_storage_raw.jsonl"
+        export_leveldb_raw(
+            ls_dir,
+            raw_path,
+            origin="",
+            root_tag=root_tag,
+            profile_name=profile_name,
+            logger=logger,
+            errors_writer=errors_writer,
+            stage=f"{stage}_raw_leveldb_failed",
+        )
+    except Exception as e:
+        log_stage_error(
+            errors_writer,
+            logger,
+            stage=f"{stage}_raw_export_failed",
+            context={"root_tag": root_tag, "profile_name": profile_name, "leveldb_dir": str(ls_dir)},
+            exc=e,
+        )
+    return {
+        "exported": True,
+        "storage_keys": storage_key_count,
+        "records": total_records,
+        "record_errors": record_errors,
+        "decode_stats": decode_stats,
+        "raw_jsonl": str(out_dir / "local_storage_raw.jsonl"),
+    }
 def export_session_storage(
     prof_dir: Path,
     profile_obj: Any,
@@ -2068,7 +2580,9 @@ def export_session_storage(
     limits = {
         "payloads_dir_name": "payloads_raw",
         "decoded_dir_name": "payloads_decoded",
-        "max_bytes_to_process": 50 * 1024 * 1024,
+        "max_bytes_to_process": MAX_INPUT_BYTES,
+        "max_decoded_bytes": MAX_DECODED_BYTES,
+        "max_decode_depth": MAX_DECODE_DEPTH,
         "max_text_chars": 20000,
         "max_json_chars": 2 * 1024 * 1024,
         "base64_preview_bytes": 64 * 1024,
@@ -2111,6 +2625,7 @@ def export_session_storage(
     exported = 0
     record_errors = 0
     host_count = 0
+    decode_stats = {"records": 0, "text_preview": 0, "json_preview": 0, "binary_only": 0, "errors": 0}
 
     try:
         db = _ccl_ss.SessionStoreDb(ss_leveldb_dir)
@@ -2165,14 +2680,44 @@ def export_session_storage(
                             payload_subdir=f"hosts/{host_slug}",
                             limits=limits,
                         )
+                        decoded_encoding = ""
+                        map_id = ""
+                        namespace_uuid = ""
+                        namespace_host = str(host)
+                        key_str = str(key)
+                        if key_str.startswith("map-"):
+                            parts = key_str.split("-", 2)
+                            if len(parts) >= 3:
+                                map_id = parts[1]
+                                key_str = parts[2]
+                        elif key_str.startswith("namespace-"):
+                            parts = key_str.split("-", 2)
+                            if len(parts) >= 3:
+                                namespace_uuid = parts[1].replace("_", "-")
+                                namespace_host = parts[2]
+                        if isinstance(value, (bytes, bytearray, memoryview)) and len(value) > 0:
+                            raw_value = bytes(value)
+                            if should_decode_utf16le(raw_value):
+                                try:
+                                    text = raw_value.decode("utf-16-le", errors="replace")
+                                    decoded["text_preview"] = text[:limits.get("max_text_chars", 20000)]
+                                    decoded["decoded_len"] = len(raw_value)
+                                    decoded_encoding = "utf-16-le"
+                                    decoded["decoded_encoding"] = decoded_encoding
+                                except Exception:
+                                    decoded["errors"].append("utf16le_decode_failed")
 
                         row = {
                             "root_tag": root_tag,
                             "profile_name": profile_name,
                             "host": str(host),
-                            "key": str(key),
+                            "key": key_str,
                             "leveldb_seq_number": seq_int if seq_int is not None else "",
                             "decoded": decoded,
+                            "map_id": map_id,
+                            "namespace_uuid": namespace_uuid,
+                            "namespace_host": namespace_host,
+                            "decoded_encoding": decoded_encoding,
                         }
                         jw.write(row)
 
@@ -2180,7 +2725,7 @@ def export_session_storage(
                             "root_tag": root_tag,
                             "profile_name": profile_name,
                             "host": str(host),
-                            "key": str(key),
+                            "key": key_str,
                             "leveldb_seq_number": seq_int if seq_int is not None else "",
                             "decoded_kind": decoded.get("kind", ""),
                             "raw_len": decoded.get("raw_len", ""),
@@ -2203,10 +2748,18 @@ def export_session_storage(
                             )
 
                         exported += 1
+                        decode_stats["records"] += 1
+                        if decoded.get("json_preview"):
+                            decode_stats["json_preview"] += 1
+                        elif decoded.get("text_preview"):
+                            decode_stats["text_preview"] += 1
+                        else:
+                            decode_stats["binary_only"] += 1
                         if exported % 5000 == 0:
                             logger.info(f"[{stage}] exported {exported} record(s) ...")
                     except Exception as e:
                         record_errors += 1
+                        decode_stats["errors"] += 1
                         log_stage_error(
                             errors_writer,
                             logger,
@@ -2225,37 +2778,68 @@ def export_session_storage(
                 exc=e,
             )
 
+    try:
+        raw_path = out_dir / "session_storage_raw.jsonl"
+        export_leveldb_raw(
+            ss_leveldb_dir,
+            raw_path,
+            origin="",
+            root_tag=root_tag,
+            profile_name=profile_name,
+            logger=logger,
+            errors_writer=errors_writer,
+            stage=f"{stage}_raw_leveldb_failed",
+        )
+    except Exception as e:
+        log_stage_error(
+            errors_writer,
+            logger,
+            stage=f"{stage}_raw_export_failed",
+            context={"root_tag": root_tag, "profile_name": profile_name, "leveldb_dir": str(ss_leveldb_dir)},
+            exc=e,
+        )
+
     return {
         "exported": True,
         "records": exported,
         "hosts": host_count,
         "record_errors": record_errors,
         "leveldb_dir": str(ss_leveldb_dir),
+        "decode_stats": decode_stats,
+        "raw_jsonl": str(out_dir / "session_storage_raw.jsonl"),
     }
 
-def find_blob_indices(value: Any, BlobIndexType: Any) -> List[Any]:
+def find_blob_indices(value: Any, BlobIndexType: Any, *, visited: Optional[set] = None) -> List[Any]:
     """
     Recursively find BlobIndex objects inside a decoded IndexedDB value.
     """
+    if BlobIndexType is None:
+        return []
     found = []
     try:
         if value is None:
             return found
-        if BlobIndexType is not None and isinstance(value, BlobIndexType):
+        if visited is None:
+            visited = set()
+        obj_id = id(value)
+        if obj_id in visited:
+            return found
+        visited.add(obj_id)
+        if isinstance(value, BlobIndexType):
             return [value]
         if isinstance(value, dict):
             for v in value.values():
-                found.extend(find_blob_indices(v, BlobIndexType))
+                found.extend(find_blob_indices(v, BlobIndexType, visited=visited))
         elif isinstance(value, (list, tuple, set)):
             for v in value:
-                found.extend(find_blob_indices(v, BlobIndexType))
+                found.extend(find_blob_indices(v, BlobIndexType, visited=visited))
         elif is_dataclass(value):
-            found.extend(find_blob_indices(asdict(value), BlobIndexType))
+            found.extend(find_blob_indices(asdict(value), BlobIndexType, visited=visited))
         elif hasattr(value, "__dict__"):
             # avoid deep recursion into huge objects; only walk public attrs
             d = {k: v for k, v in vars(value).items() if not k.startswith("_")}
             if d:
-                found.extend(find_blob_indices(d, BlobIndexType))
+                found.extend(find_blob_indices(d, BlobIndexType, visited=visited))
     except Exception:
         pass
     return found
@@ -2342,6 +2926,11 @@ def export_indexeddb(
     *,
     extract_blobs: bool = False,
     blob_max_bytes: int = 5_000_000,
+    blob_max_total_bytes: int = 50_000_000,
+    blob_max_per_db: int = 200,
+    root_tag: Optional[str] = None,
+    profile_name: Optional[str] = None,
+    errors_writer: Optional["SafeJsonlWriter"] = None,
 ) -> Dict[str, Any]:
     """
     Export IndexedDB records via ccl_chromium_reader in a resilient way.
@@ -2361,11 +2950,13 @@ def export_indexeddb(
         "blobs_copied": 0,
         "errors": 0,
     }
+    decode_stats = {"records": 0, "value_json": 0, "text_preview": 0, "binary_only": 0, "errors": 0}
 
     hosts_path = out_dir / "indexeddb_hosts.txt"
     records_csv = out_dir / "indexeddb_records.csv"
     records_jsonl = out_dir / "indexeddb_records.jsonl"
     blobs_dir = out_dir / "indexeddb_blobs"
+    blobs_index_path = out_dir / "indexeddb_blobs.jsonl"
     if extract_blobs:
         blobs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2405,6 +2996,71 @@ def export_indexeddb(
         except Exception:
             return ""
 
+    def _bounded_value_json(val: Any, *, max_chars: int = 200_000) -> Tuple[Any, str]:
+        try:
+            if isinstance(val, (bytes, bytearray, memoryview)):
+                return compact_bytes_json(val), "bytes"
+            obj = jsonable(val)
+            kind = type(obj).__name__
+            try:
+                s = json.dumps(obj, ensure_ascii=False)
+                if len(s) > max_chars:
+                    return {
+                        "_kind": "truncated_json",
+                        "raw_len": len(s),
+                        "preview": s[:max_chars],
+                    }, "truncated_json"
+            except Exception:
+                pass
+            return obj, kind
+        except Exception:
+            return None, ""
+
+    def _blob_ref_info(blob_ref: Any) -> Dict[str, Any]:
+        try:
+            blob_number = (
+                getattr(blob_ref, "blob_number", None)
+                or getattr(blob_ref, "file_number", None)
+                or getattr(blob_ref, "number", None)
+            )
+            mime = getattr(blob_ref, "mime_type", None) or getattr(blob_ref, "mime", None) or ""
+            size = getattr(blob_ref, "size", None) or getattr(blob_ref, "length", None) or ""
+            return {
+                "blob_number": blob_number if blob_number is not None else "",
+                "mime_type": str(mime) if mime else "",
+                "declared_size": size if size is not None else "",
+            }
+        except Exception:
+            return {"blob_number": "", "mime_type": "", "declared_size": ""}
+
+    def _indexeddb_record_context(rec: Any) -> Dict[str, str]:
+        try:
+            origin = (
+                getattr(rec, "origin", None)
+                or getattr(rec, "origin_url", None)
+                or getattr(rec, "origin_host", None)
+                or ""
+            )
+            db_name = (
+                getattr(rec, "database_name", None)
+                or getattr(rec, "db_name", None)
+                or getattr(rec, "database", None)
+                or ""
+            )
+            obj_store_name = (
+                getattr(rec, "object_store_name", None)
+                or getattr(rec, "obj_store_name", None)
+                or getattr(rec, "store_name", None)
+                or ""
+            )
+            return {
+                "origin": str(origin) if origin is not None else "",
+                "database_name": str(db_name) if db_name is not None else "",
+                "object_store_name": str(obj_store_name) if obj_store_name is not None else "",
+            }
+        except Exception:
+            return {"origin": "", "database_name": "", "object_store_name": ""}
+
     # Iterate hosts
     try:
         hosts = list(profile_obj.iter_indexeddb_hosts())
@@ -2427,6 +3083,9 @@ def export_indexeddb(
         "is_live",
         "ldb_seq_no",
         "origin_file",
+        "origin",
+        "database_name",
+        "object_store_name",
         "key_b64",
         "key_preview",
         "value_type",
@@ -2444,13 +3103,82 @@ def export_indexeddb(
         result["errors"] += 1
         return result
 
+    bad_records_writer: Optional[JsonlWriter] = None
+    bad_records_path = out_dir / "indexeddb_bad_records.jsonl"
+    blobs_index_writer: Optional[JsonlWriter] = None
+    total_blob_bytes = 0
+    blobs_extracted = 0
+    blobs_skipped = 0
+    blobs_per_db: Dict[Tuple[str, Any], int] = {}
+    try:
+        from ccl_chromium_reader.ccl_chromium_indexeddb import BlobIndex as _BlobIndexType  # type: ignore
+    except Exception:
+        _BlobIndexType = None
+
     with jf:
         csv_enabled = (cw is not None)
         csv_disabled_logged = False
         for host_id in hosts:
             logger.debug(f"IndexedDB host: {host_id}")
             try:
-                iterator = profile_obj.iter_indexeddb_records(host_id, include_deletions=True)
+                kwargs = {"include_deletions": True}
+                try:
+                    sig = inspect.signature(profile_obj.iter_indexeddb_records)
+                    if "errors_to_stdout" in sig.parameters:
+                        kwargs["errors_to_stdout"] = True
+                    if "bad_deserializer_data_handler" in sig.parameters:
+                        def _bad_handler(key_data, value_data, *args, **handler_kwargs):
+                            nonlocal bad_records_writer
+                            if bad_records_writer is None:
+                                bad_records_writer = JsonlWriter(bad_records_path)
+                            key_b64 = bounded_b64(key_data, max_bytes=64 * 1024)
+                            val_b64 = bounded_b64(value_data, max_bytes=64 * 1024)
+                            key_sha = hashlib.sha256(key_data or b"").hexdigest() if key_data else ""
+                            val_sha = hashlib.sha256(value_data or b"").hexdigest() if value_data else ""
+                            bad_evt = {
+                                "root_tag": root_tag or "",
+                                "profile_name": profile_name or "",
+                                "origin": "",
+                                "host_id": host_id,
+                                "db_id": "",
+                                "obj_store_id": "",
+                                "origin_file": "",
+                                "seq_or_offset": "",
+                                "key_b64": key_b64["b64"],
+                                "key_b64_truncated": key_b64["truncated"],
+                                "key_raw_len": key_b64["raw_len"],
+                                "key_sha256": key_sha,
+                                "value_b64": val_b64["b64"],
+                                "value_b64_truncated": val_b64["truncated"],
+                                "value_raw_len": val_b64["raw_len"],
+                                "value_sha256": val_sha,
+                                "error": "deserializer_failed",
+                            }
+                            bad_records_writer.write(bad_evt)
+                            log_stage_error(
+                                errors_writer,
+                                logger,
+                                stage="indexeddb_deserialize_failed",
+                                context={
+                                    "root_tag": root_tag or "",
+                                    "profile_name": profile_name or "",
+                                    "origin": "",
+                                    "host_id": host_id,
+                                    "db_id": "",
+                                    "obj_store_id": "",
+                                    "origin_file": "",
+                                    "seq_or_offset": "",
+                                    "key_raw_len": key_b64["raw_len"],
+                                    "value_raw_len": val_b64["raw_len"],
+                                    "key_sha256": key_sha,
+                                    "value_sha256": val_sha,
+                                    "error": "deserializer_failed",
+                                },
+                            )
+                        kwargs["bad_deserializer_data_handler"] = _bad_handler
+                except Exception:
+                    pass
+                iterator = profile_obj.iter_indexeddb_records(host_id, **kwargs)
             except Exception as e:
                 result["errors"] += 1
                 logger.warn(f"iter_indexeddb_records failed for host {host_id}: {e}")
@@ -2468,6 +3196,7 @@ def export_indexeddb(
                     break
 
                 result["records"] += 1
+                decode_stats["records"] += 1
 
                 try:
                     key_bytes = _key_bytes(getattr(rec, "key", None))
@@ -2477,9 +3206,18 @@ def export_indexeddb(
                     val = getattr(rec, "value", None)
                     val_type = type(val).__name__ if val is not None else ""
                     val_preview = _value_preview(val)
+                    val_json, val_json_kind = _bounded_value_json(val)
+                    if val_json is not None and val_json_kind:
+                        decode_stats["value_json"] += 1
+                    if isinstance(val, (bytes, bytearray, memoryview)):
+                        decode_stats["binary_only"] += 1
+                    else:
+                        decode_stats["text_preview"] += 1
 
                     ext = getattr(rec, "external_value_path", None)
                     blob_copied_as = ""
+                    blob_refs = []
+                    blob_extracted = []
 
                     # Optional external blob copy
                     if extract_blobs and ext:
@@ -2502,6 +3240,96 @@ def export_indexeddb(
                             result["errors"] += 1
                             logger.warn(f"Blob copy failed for host {host_id}: {e}")
 
+                    # Optional BlobIndex extraction from decoded value
+                    try:
+                        blob_refs = find_blob_indices(val, _BlobIndexType)
+                    except Exception:
+                        blob_refs = []
+
+                    for blob_ref in blob_refs:
+                        info = _blob_ref_info(blob_ref)
+                        if not extract_blobs:
+                            blobs_skipped += 1
+                            blob_extracted.append(info)
+                            continue
+                        key = (host_id, getattr(rec, "db_id", ""))
+                        blobs_per_db.setdefault(key, 0)
+                        if blobs_per_db[key] >= blob_max_per_db:
+                            info["skipped_reason"] = "max_blobs_per_db"
+                            blobs_skipped += 1
+                            blob_extracted.append(info)
+                            continue
+                        if total_blob_bytes >= blob_max_total_bytes:
+                            info["skipped_reason"] = "max_total_bytes"
+                            blobs_skipped += 1
+                            blob_extracted.append(info)
+                            continue
+                        try:
+                            if hasattr(rec, "get_blob_stream"):
+                                with rec.get_blob_stream(blob_ref) as f:
+                                    data = f.read(blob_max_bytes + 1)
+                            else:
+                                data = b""
+                            truncated = len(data) > blob_max_bytes
+                            if truncated:
+                                data = data[:blob_max_bytes]
+                            size = len(data)
+                            if size == 0:
+                                info["skipped_reason"] = "empty_blob"
+                                blobs_skipped += 1
+                                blob_extracted.append(info)
+                                continue
+                            if total_blob_bytes + size > blob_max_total_bytes:
+                                info["skipped_reason"] = "max_total_bytes"
+                                blobs_skipped += 1
+                                blob_extracted.append(info)
+                                continue
+                            sha = hashlib.sha256(data).hexdigest()
+                            blob_name = slug(f"{host_id}_{getattr(rec, 'db_id', '')}_{info.get('blob_number', '')}_{sha}", max_len=160)
+                            blob_path = blobs_dir / f"{blob_name}.bin"
+                            if not blob_path.exists():
+                                blob_path.write_bytes(data)
+                            total_blob_bytes += size
+                            blobs_per_db[key] += 1
+                            blobs_extracted += 1
+                            info.update({
+                                "sha256": sha,
+                                "size": size,
+                                "truncated": truncated,
+                                "extracted_path": str(blob_path),
+                            })
+                            blob_extracted.append(info)
+                            if blobs_index_writer is None:
+                                blobs_index_writer = JsonlWriter(blobs_index_path)
+                            blobs_index_writer.write({
+                                "root_tag": root_tag or "",
+                                "profile_name": profile_name or "",
+                                "origin": getattr(rec, "origin", "") or getattr(rec, "origin_url", "") or "",
+                                "host_id": host_id,
+                                "db_id": getattr(rec, "db_id", ""),
+                                "obj_store_id": getattr(rec, "obj_store_id", ""),
+                                **info,
+                            })
+                        except Exception as e:
+                            info["error"] = f"{type(e).__name__}: {e}"
+                            blobs_skipped += 1
+                            blob_extracted.append(info)
+                            log_stage_error(
+                                errors_writer,
+                                logger,
+                                stage="indexeddb_blob_extract_failed",
+                                context={
+                                    "root_tag": root_tag or "",
+                                    "profile_name": profile_name or "",
+                                    "origin": getattr(rec, "origin", "") or getattr(rec, "origin_url", "") or "",
+                                    "host_id": host_id,
+                                    "db_id": getattr(rec, "db_id", ""),
+                                    "obj_store_id": getattr(rec, "obj_store_id", ""),
+                                    "blob_number": info.get("blob_number", ""),
+                                },
+                                exc=e,
+                            )
+
                     row = {
                         "host_id": host_id,
                         "db_id": getattr(rec, "db_id", ""),
@@ -2513,13 +3341,18 @@ def export_indexeddb(
                         "key_preview": key_preview,
                         "value_type": val_type,
                         "value_preview": val_preview,
+                        "value_json": val_json,
+                        "value_json_kind": val_json_kind,
                         "external_value_path": str(ext) if ext else "",
                         "blob_copied_as": blob_copied_as,
+                        "blob_refs": [jsonable(_blob_ref_info(b)) for b in blob_refs] if blob_refs else [],
+                        "blob_extracted": blob_extracted,
                     }
+                    row.update(_indexeddb_record_context(rec))
                     jf.write(json.dumps(row, ensure_ascii=False) + "\n")
                     if csv_enabled:
                         try:
-                            cw.write(row)
+                            cw.write(filter_csv_row(row, fieldnames))
                         except Exception as e:
                             result["errors"] += 1
                             if not csv_disabled_logged:
@@ -2528,10 +3361,23 @@ def export_indexeddb(
                             csv_enabled = False
                 except Exception as e:
                     result["errors"] += 1
+                    decode_stats["errors"] += 1
                     logger.warn(f"IndexedDB record export failed for host {host_id}: {e}")
                     continue
 
     cw.close()
+    if blobs_index_writer is not None:
+        blobs_index_writer.close()
+    if bad_records_writer is not None:
+        bad_records_writer.close()
+    result["decode_stats"] = decode_stats
+    result["blob_stats"] = {
+        "extracted": blobs_extracted,
+        "skipped": blobs_skipped,
+        "total_bytes": total_blob_bytes,
+        "max_total_bytes": blob_max_total_bytes,
+        "max_per_db": blob_max_per_db,
+    }
     return result
 
 
@@ -2942,6 +3788,17 @@ def build_report(out_dir: Path, manifest: Dict[str, Any], logger: Logger) -> Non
             arts = p.get("exports", {})
             # show what succeeded
             lines.append(f"    - Export groups: {', '.join(sorted(arts.keys())) if arts else ''}")
+            for name, data in (arts or {}).items():
+                if isinstance(data, dict) and data.get("decode_stats"):
+                    ds = data.get("decode_stats") or {}
+                    lines.append(
+                        "    - "
+                        f"{name} decode: records={ds.get('records', '')} "
+                        f"json={ds.get('json_preview', ds.get('value_json', ''))} "
+                        f"text={ds.get('text_preview', '')} "
+                        f"binary={ds.get('binary_only', '')} "
+                        f"errors={ds.get('errors', '')}"
+                    )
         lines.append("")
     report.write_text("\n".join(lines) + "\n", encoding="utf-8", errors="replace")
 
@@ -2961,6 +3818,8 @@ def main() -> int:
 
     ap.add_argument("--indexeddb-extract-blobs", action="store_true", help="Extract IndexedDB external blobs to disk (bounded).")
     ap.add_argument("--indexeddb-blob-max-bytes", type=int, default=5_000_000, help="Max bytes per extracted IndexedDB blob (default: 5,000,000).")
+    ap.add_argument("--indexeddb-blob-max-total-bytes", type=int, default=50_000_000, help="Max total bytes extracted from IndexedDB blobs (default: 50,000,000).")
+    ap.add_argument("--indexeddb-blob-max-per-db", type=int, default=200, help="Max blobs extracted per IndexedDB database (default: 200).")
 
     ap.add_argument("--filesystem-copy-files", action="store_true", help="Copy File System API stored files (bounded by total bytes).")
     ap.add_argument("--filesystem-copy-max-total-bytes", type=int, default=200_000_000, help="Max total bytes to copy from File System API (default: 200,000,000).")
@@ -3176,6 +4035,11 @@ def main() -> int:
                         logger,
                         extract_blobs=args.indexeddb_extract_blobs,
                         blob_max_bytes=args.indexeddb_blob_max_bytes,
+                        blob_max_total_bytes=args.indexeddb_blob_max_total_bytes,
+                        blob_max_per_db=args.indexeddb_blob_max_per_db,
+                        root_tag=root_tag,
+                        profile_name=profile_name,
+                        errors_writer=errors_writer,
                     )
                 except Exception as e:
                     log_stage_error(
