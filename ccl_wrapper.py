@@ -2618,6 +2618,9 @@ def export_session_storage(
         "profile_name",
         "host",
         "key",
+        "map_id",
+        "namespace_uuid",
+        "namespace_host",
         "leveldb_seq_number",
         "decoded_kind",
         "raw_len",
@@ -2627,6 +2630,7 @@ def export_session_storage(
         "json_preview",
         "extracted_files_count",
         "first_extracted_file",
+        "decoded_encoding",
     ]
 
     limits = {
@@ -2778,6 +2782,9 @@ def export_session_storage(
                             "profile_name": profile_name,
                             "host": str(host),
                             "key": key_str,
+                            "map_id": map_id,
+                            "namespace_uuid": namespace_uuid,
+                            "namespace_host": namespace_host,
                             "leveldb_seq_number": seq_int if seq_int is not None else "",
                             "decoded_kind": decoded.get("kind", ""),
                             "raw_len": decoded.get("raw_len", ""),
@@ -2787,6 +2794,7 @@ def export_session_storage(
                             "json_preview": decoded.get("json_preview", "") or "",
                             "extracted_files_count": len(decoded.get("extracted_files", []) or []),
                             "first_extracted_file": (decoded.get("extracted_files", []) or [""])[0],
+                            "decoded_encoding": decoded.get("decoded_encoding", ""),
                         }
                         try:
                             cw.write_row(csv_row)
