@@ -2049,12 +2049,16 @@ def export_downloads(profile_obj: Any, prof_dir: Path, profile_out_dir: Path, ro
             return iter(())
         # Copy to temp to avoid locking issues
         tmp = out_dir / f"_History_{history.stat().st_size}.sqlite"
+        temp_path = tmp
+        temp_created = False
         try:
             shutil.copy2(history, tmp)
+            temp_created = True
         except Exception:
-            tmp = history
+            temp_path = history
+        conn = None
         try:
-            conn = sqlite3.connect(str(tmp))
+            conn = sqlite3.connect(str(temp_path))
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             # Column discovery
@@ -2113,10 +2117,16 @@ def export_downloads(profile_obj: Any, prof_dir: Path, profile_out_dir: Path, ro
                     "by_ext_name": r["by_ext_name"] if "by_ext_name" in colset else None,
                 }
         finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if temp_created:
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
 
     def _iter_downloads_shared_proto_db() -> Iterator[Any]:
         # Returns an iterator of download objects from shared_proto_db, if available.
