@@ -208,18 +208,9 @@ def jsonable(x: Any) -> Any:
         if isinstance(x, (str, int, float, bool)):
             return x
         if isinstance(x, (bytes, bytearray, memoryview)):
+            # Keep bytes bounded in JSON outputs; align with compact_bytes_json for consistency.
             b = x.tobytes() if isinstance(x, memoryview) else (bytes(x) if isinstance(x, bytearray) else x)
-            # Keep bytes bounded in JSON outputs; full bytes should live in separate files.
-            max_preview = 4096
-            preview = b[:max_preview]
-            return {
-                "_kind": "bytes",
-                "len": len(b),
-                "sha256": hashlib.sha256(b).hexdigest(),
-                "text_preview": best_effort_text(preview, max_len=20_000),
-                "b64_preview": __import__("base64").b64encode(preview).decode("ascii"),
-                "preview_truncated": len(preview) < len(b),
-            }
+            return compact_bytes_json(b)
         if isinstance(x, (list, tuple, set)):
             return [jsonable(v) for v in x]
         if isinstance(x, dict):
@@ -277,6 +268,37 @@ def write_json(path: Path, obj: Any) -> None:
     with path.open("w", encoding="utf-8", errors="replace", newline="\n") as f:
         json.dump(jsonable(obj), f, ensure_ascii=False, indent=2)
         f.write("\n")
+
+
+def _collect_b64_candidate(payload: str, *, max_chars: int) -> Tuple[Optional[str], bool]:
+    """Return whitespace-stripped base64 candidate without allocating beyond max_chars."""
+    if len(payload) <= max_chars and not any(ch.isspace() for ch in payload):
+        return payload, False
+    chars: List[str] = []
+    count = 0
+    for ch in payload:
+        if ch.isspace():
+            continue
+        count += 1
+        if count > max_chars:
+            return None, True
+        chars.append(ch)
+    return "".join(chars), False
+
+
+def _looks_like_text_bytes(data: bytes, *, sample_size: int = 512) -> bool:
+    if not data:
+        return False
+    sample = data[:sample_size]
+    if b"\x00" in sample:
+        return False
+    try:
+        sample.decode("utf-8")
+        return True
+    except Exception:
+        pass
+    printable = sum(1 for b in sample if 32 <= b < 127 or b in b"\r\n\t")
+    return printable / len(sample) >= 0.9
 
 def build_self_check() -> Dict[str, Any]:
     info: Dict[str, Any] = {
@@ -660,6 +682,7 @@ def _decode_bytes_pipeline(
             "decoded_encoding": "",
             "transform_chain": [],
             "was_truncated": len(data) > max_decoded_bytes,
+            "notes": [],
             "error": "max_decode_depth",
         }
 
@@ -682,6 +705,7 @@ def _decode_bytes_pipeline(
         )
         res["transform_chain"] = [transform] + res.get("transform_chain", [])
         res["was_truncated"] = res.get("was_truncated", False) or truncated
+        res.setdefault("notes", [])
         return res
 
     # Base64
@@ -710,10 +734,11 @@ def _decode_bytes_pipeline(
             return _chain_result("gzip", out, truncated=truncated)
         except Exception as e:
             return {
-                "decoded_bytes": b"",
+                "decoded_bytes": data[:max_decoded_bytes],
                 "decoded_encoding": "",
                 "transform_chain": ["gzip"],
-                "was_truncated": False,
+                "was_truncated": len(data) > max_decoded_bytes,
+                "notes": ["gzip_failed"],
                 "error": f"gzip_failed: {type(e).__name__}: {e}",
             }
 
@@ -727,10 +752,11 @@ def _decode_bytes_pipeline(
             return _chain_result("zlib", out, truncated=truncated)
         except Exception as e:
             return {
-                "decoded_bytes": b"",
+                "decoded_bytes": data[:max_decoded_bytes],
                 "decoded_encoding": "",
                 "transform_chain": ["zlib"],
-                "was_truncated": False,
+                "was_truncated": len(data) > max_decoded_bytes,
+                "notes": ["zlib_failed"],
                 "error": f"zlib_failed: {type(e).__name__}: {e}",
             }
 
@@ -758,16 +784,17 @@ def _decode_bytes_pipeline(
     except Exception:
         pass
 
-    # snappy (only when input is small)
+    # snappy (only when input is small and doesn't look like plain text)
+    snappy_failed = False
     try:
         import snappy  # type: ignore
-        if len(data) <= MAX_SNAPPY_INPUT_BYTES:
+        if len(data) <= MAX_SNAPPY_INPUT_BYTES and not _looks_like_text_bytes(data):
             try:
                 out = snappy.decompress(data)
                 out, truncated = _clip_output(out)
                 return _chain_result("snappy", out, truncated=truncated)
             except Exception:
-                pass
+                snappy_failed = True
     except Exception:
         pass
 
@@ -777,14 +804,19 @@ def _decode_bytes_pipeline(
             "decoded_encoding": "",
             "transform_chain": ["zip_detected"],
             "was_truncated": len(data) > max_decoded_bytes,
+            "notes": [],
             "error": "zip_detected",
         }
 
+    notes: List[str] = []
+    if snappy_failed:
+        notes.append("snappy_failed")
     return {
         "decoded_bytes": data[:max_decoded_bytes],
         "decoded_encoding": "",
         "transform_chain": [],
         "was_truncated": len(data) > max_decoded_bytes,
+        "notes": notes,
         "error": "",
     }
 
@@ -833,6 +865,9 @@ def smart_decode_payload(
         "extracted_files": [],
         "raw_b64_preview": None,
         "raw_b64_truncated": None,
+        # raw_text_* reserved for oversized base64 candidates; keep minimal for schema stability.
+        "raw_text_preview": None,
+        "raw_text_truncated": None,
         "was_truncated": False,
         "notes": [],
         "errors": [],
@@ -861,11 +896,14 @@ def smart_decode_payload(
                     pass
             # Try base64 decode for string payloads, then re-run pipeline
             try:
-                candidate = re.sub(r"\s+", "", payload)
                 max_b64_chars = (lim["max_bytes_to_process"] * 4) // 3 + 8
-                if len(candidate) > max_b64_chars:
+                candidate, too_large = _collect_b64_candidate(payload, max_chars=max_b64_chars)
+                if too_large:
                     info["notes"].append("base64_skipped_too_large")
-                elif len(candidate) >= 16 and len(candidate) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/=]+", candidate):
+                    # Preserve raw string preview when base64 is skipped due to size.
+                    info["raw_text_preview"] = payload[: lim["max_text_chars"]]
+                    info["raw_text_truncated"] = len(payload) > lim["max_text_chars"]
+                elif candidate and len(candidate) >= 16 and len(candidate) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/=]+", candidate):
                     try:
                         decoded = base64.b64decode(candidate, validate=True)
                     except Exception:
@@ -884,6 +922,8 @@ def smart_decode_payload(
                         info["was_truncated"] = res["was_truncated"]
                         if res.get("error"):
                             info["errors"].append(res["error"])
+                        if res.get("notes"):
+                            info["notes"].extend(res["notes"])
                         preview = best_effort_text(data, max_len=lim["max_text_chars"])
                         info["text_preview"] = preview
                         if preview and preview.lstrip()[:1] in "{[" and len(preview) <= lim["max_json_chars"]:
@@ -959,6 +999,8 @@ def smart_decode_payload(
         info["was_truncated"] = res["was_truncated"]
         if res.get("error"):
             info["errors"].append(res["error"])
+        if res.get("notes"):
+            info["notes"].extend(res["notes"])
         data = res["decoded_bytes"]
 
         info["decoded_len"] = len(data) if isinstance(data, (bytes, bytearray)) else None
