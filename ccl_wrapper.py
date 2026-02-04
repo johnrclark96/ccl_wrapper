@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 r"""
 run_ccl_chromium_export_merged_v15.py
 

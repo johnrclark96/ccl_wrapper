@@ -1,4 +1,4 @@
-﻿# Agent Instructions (CCL Wrapper)
+# Agent Instructions (CCL Wrapper)
 
 This repository is code-only. Never add private data, exports, logs, databases, or decoded artifacts.
 

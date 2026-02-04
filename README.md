@@ -1,4 +1,4 @@
-﻿CCL Chromium Reader Wrapper
+CCL Chromium Reader Wrapper
 
 This repo contains the code-only wrapper script used to export Chromium artifacts via ccl_chromium_reader.
 Private datasets and export outputs are intentionally excluded.
