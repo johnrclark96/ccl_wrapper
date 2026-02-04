@@ -2930,7 +2930,7 @@ def _salvage_indexeddb_blob_dir(profile_path, host_id, out_dir, *, root_tag=None
         total_bytes = 0
         files = 0
 
-        with JsonlWriter(inv_jsonl) as jw, SafeCsvWriter(inv_csv, fieldnames=["rel_path", "size_bytes", "mtime_utc", "copied_to"]) as cw:
+        with JsonlWriter(inv_jsonl) as jw, CsvWriter(inv_csv, fieldnames=["rel_path", "size_bytes", "mtime_utc", "copied_to"]) as cw:
             for p in blob_dir.rglob("*"):
                 if not p.is_file():
                     continue
@@ -2959,7 +2959,7 @@ def _salvage_indexeddb_blob_dir(profile_path, host_id, out_dir, *, root_tag=None
                     event["profile_name"] = profile_name
 
                 jw.write(event)
-                cw.writerow(row)
+                cw.write_row(row)
                 files += 1
 
         return str(dest)
