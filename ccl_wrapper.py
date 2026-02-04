@@ -2979,6 +2979,112 @@ def _salvage_indexeddb_blob_dir(profile_path, host_id, out_dir, *, root_tag=None
             )
         return None
 
+def _indexeddb_blob_filename_candidates(blob_number: Any) -> List[str]:
+    try:
+        if blob_number is None:
+            return []
+        raw = str(blob_number)
+        if not raw:
+            return []
+        candidates = [raw]
+        if raw.isdigit():
+            num = int(raw)
+            for width in (8, 10, 16):
+                padded = f"{num:0{width}d}"
+                if padded not in candidates:
+                    candidates.append(padded)
+        return candidates
+    except Exception:
+        return []
+
+def _read_indexeddb_blob_file(path: Path, *, blob_max_bytes: int) -> Dict[str, Any]:
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(blob_max_bytes + 1)
+        truncated = len(data) > blob_max_bytes
+        if truncated:
+            data = data[:blob_max_bytes]
+        return {
+            "data": data,
+            "size": len(data),
+            "truncated": truncated,
+            "path": str(path),
+            "reason": "",
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "data": None,
+            "size": 0,
+            "truncated": False,
+            "path": str(path),
+            "reason": "blob_read_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+def _read_indexeddb_blob_fallback(
+    profile_path: Path,
+    host_id: str,
+    blob_number: Any,
+    *,
+    blob_max_bytes: int,
+    max_scan_files: int = 5000,
+) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "host_id": host_id,
+        "blob_number": blob_number if blob_number is not None else "",
+        "blob_source": "path_fallback",
+        "data": None,
+        "size": 0,
+        "truncated": False,
+        "path": "",
+        "reason": "",
+        "error": "",
+    }
+    candidates = _indexeddb_blob_filename_candidates(blob_number)
+    if not candidates:
+        info["reason"] = "missing_blob_number"
+        return info
+
+    blob_dir = Path(profile_path) / "IndexedDB" / f"{host_id}.indexeddb.blob"
+    if not blob_dir.exists() or not blob_dir.is_dir():
+        info["reason"] = "blob_dir_missing"
+        return info
+
+    for name in candidates:
+        direct_path = blob_dir / name
+        if direct_path.is_file():
+            read_info = _read_indexeddb_blob_file(direct_path, blob_max_bytes=blob_max_bytes)
+            info.update(read_info)
+            return info
+
+    best_match: Optional[Path] = None
+    scanned = 0
+    candidate_set = set(candidates)
+    for path in blob_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        scanned += 1
+        if scanned > max_scan_files:
+            break
+        name = path.name
+        stem = path.stem
+        if name in candidate_set or stem in candidate_set:
+            if best_match is None or str(path) < str(best_match):
+                best_match = path
+
+    if best_match is not None:
+        read_info = _read_indexeddb_blob_file(best_match, blob_max_bytes=blob_max_bytes)
+        info.update(read_info)
+        return info
+
+    info["reason"] = "blob_scan_limit" if scanned > max_scan_files else "blob_file_missing"
+    return info
+
+def _blob_stream_not_supported(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "not supported" in msg or "unsupported" in msg or "not implemented" in msg
+
 def export_indexeddb(
     profile_obj: "ChromiumProfileFolder",
     out_dir: Path,
@@ -3325,14 +3431,55 @@ def export_indexeddb(
                             blob_extracted.append(info)
                             continue
                         try:
+                            data = None
+                            truncated = False
+                            blob_source = ""
+                            fallback_info: Dict[str, Any] = {}
                             if hasattr(rec, "get_blob_stream"):
-                                with rec.get_blob_stream(blob_ref) as f:
-                                    data = f.read(blob_max_bytes + 1)
+                                try:
+                                    with rec.get_blob_stream(blob_ref) as f:
+                                        data = f.read(blob_max_bytes + 1)
+                                    blob_source = "get_blob_stream"
+                                except Exception as exc:
+                                    if _blob_stream_not_supported(exc):
+                                        fallback_info = _read_indexeddb_blob_fallback(
+                                            Path(profile_obj.path),
+                                            host_id,
+                                            info.get("blob_number"),
+                                            blob_max_bytes=blob_max_bytes,
+                                        )
+                                        data = fallback_info.get("data")
+                                        truncated = fallback_info.get("truncated", False)
+                                        blob_source = "path_fallback"
+                                    else:
+                                        raise
                             else:
-                                data = b""
-                            truncated = len(data) > blob_max_bytes
-                            if truncated:
-                                data = data[:blob_max_bytes]
+                                fallback_info = _read_indexeddb_blob_fallback(
+                                    Path(profile_obj.path),
+                                    host_id,
+                                    info.get("blob_number"),
+                                    blob_max_bytes=blob_max_bytes,
+                                )
+                                data = fallback_info.get("data")
+                                truncated = fallback_info.get("truncated", False)
+                                blob_source = "path_fallback"
+
+                            info["blob_source"] = blob_source
+                            if blob_source == "path_fallback":
+                                if fallback_info.get("path"):
+                                    info["fallback_path"] = fallback_info.get("path")
+                                if fallback_info.get("reason"):
+                                    info["fallback_reason"] = fallback_info.get("reason")
+                                if fallback_info.get("error"):
+                                    info["fallback_error"] = fallback_info.get("error")
+                            if data is None:
+                                blobs_skipped += 1
+                                blob_extracted.append(info)
+                                continue
+                            if blob_source == "get_blob_stream":
+                                truncated = len(data) > blob_max_bytes
+                                if truncated:
+                                    data = data[:blob_max_bytes]
                             size = len(data)
                             if size == 0:
                                 info["skipped_reason"] = "empty_blob"
