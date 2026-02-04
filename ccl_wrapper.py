@@ -303,7 +303,7 @@ def build_self_check() -> Dict[str, Any]:
 def capture_fatal_exception(exc: BaseException, *, out_dir: Optional[Path], errors_path: Optional[Path]) -> int:
     exc_type = type(exc).__name__
     exc_msg = str(exc)
-    tb = traceback.format_exc()
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     header = f"{exc_type}: {exc_msg}"
     fatal_text = f"{header}\n{tb}"
     print(header, file=sys.stderr, flush=True)
@@ -2258,12 +2258,22 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
     meta_by_storage_key: Dict[str, Dict[str, Any]] = {}
     decode_stats = {"records": 0, "text_preview": 0, "json_preview": 0, "binary_only": 0, "errors": 0}
 
-    from ccl_chromium_reader.ccl_chromium_localstorage import LocalStoreDb  # type: ignore
-
     ls_dir = prof_dir / "Local Storage" / "leveldb"
     if not ls_dir.exists():
         logger.warn(f"[{stage}] missing directory: {ls_dir}")
         return {"exported": False, "reason": "missing_local_storage_leveldb", "ls_dir": str(ls_dir)}
+
+    try:
+        from ccl_chromium_reader.ccl_chromium_localstorage import LocalStoreDb  # type: ignore
+    except ImportError as e:
+        logger.warn(f"[{stage}] missing dependency: ccl_chromium_reader ({e})")
+        return {
+            "exported": False,
+            "reason": "missing_dependency",
+            "dependency": "ccl_chromium_reader",
+            "ls_dir": str(ls_dir),
+            "error": str(e),
+        }
 
     try:
         lsdb = LocalStoreDb(ls_dir)
