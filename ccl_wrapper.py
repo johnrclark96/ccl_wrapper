@@ -2498,6 +2498,7 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
                             except Exception:
                                 decoded["errors"].append("latin1_decode_failed")
 
+                    decoded_encoding_for_csv = decoded.get("decoded_encoding", "")
                     meta = {}
                     if isinstance(script_key, str) and script_key.startswith("META:") and isinstance(value, (bytes, bytearray, memoryview)):
                         meta = _parse_localstorage_meta(bytes(value))
@@ -2519,7 +2520,7 @@ def export_local_storage(profile_obj: Any, prof_dir: Path, profile_out_dir: Path
                         "b64_preview": decoded.get("b64_preview"),
                         "extracted_files_count": decoded.get("extracted_files_count"),
                         "first_extracted_file": decoded.get("first_extracted_file"),
-                        "decoded_encoding": decoded_encoding,
+                        "decoded_encoding": decoded_encoding_for_csv,
                         "meta_batch_timestamp_utc": meta_by_storage_key.get(storage_key_str, {}).get("meta_batch_timestamp_utc", ""),
                         "meta_batch_size_bytes": meta_by_storage_key.get(storage_key_str, {}).get("meta_batch_size_bytes", ""),
                     }
