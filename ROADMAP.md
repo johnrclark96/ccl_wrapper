@@ -1,4 +1,4 @@
-﻿CCL Wrapper Roadmap (Source of Truth)
+CCL Wrapper Roadmap (Source of Truth)
 
 Chunk 0+1+2 (first PR):
 - --self-check => self_check.json with environment + library provenance
