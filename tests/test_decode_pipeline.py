@@ -81,6 +81,34 @@ def test_decode_pipeline_returns_original_bytes():
     assert res["error"] == ""
 
 
+def test_gzip_failure_preserves_original_bytes():
+    data = b"\x1f\x8b\x08\x00not-gzip"
+    res = ccl_wrapper._decode_bytes_pipeline(
+        data,
+        max_input_bytes=ccl_wrapper.MAX_INPUT_BYTES,
+        max_decoded_bytes=ccl_wrapper.MAX_DECODED_BYTES,
+        max_depth=ccl_wrapper.MAX_DECODE_DEPTH,
+    )
+    assert res["decoded_bytes"] == data
+    assert res["transform_chain"] == ["gzip"]
+    assert "gzip_failed" in (res.get("error") or "")
+    assert "gzip_failed" in (res.get("notes") or [])
+
+
+def test_zlib_failure_preserves_original_bytes():
+    data = b"\x78\x9c\x00\x01bad"
+    res = ccl_wrapper._decode_bytes_pipeline(
+        data,
+        max_input_bytes=ccl_wrapper.MAX_INPUT_BYTES,
+        max_decoded_bytes=ccl_wrapper.MAX_DECODED_BYTES,
+        max_depth=ccl_wrapper.MAX_DECODE_DEPTH,
+    )
+    assert res["decoded_bytes"] == data
+    assert res["transform_chain"] == ["zlib"]
+    assert "zlib_failed" in (res.get("error") or "")
+    assert "zlib_failed" in (res.get("notes") or [])
+
+
 def test_filter_csv_row_strips_extra_keys():
     row = {"a": 1, "b": 2, "extra": 3}
     filtered = ccl_wrapper.filter_csv_row(row, ["a", "b"])
@@ -159,6 +187,13 @@ def test_compact_bytes_json_preview_is_bounded():
     assert obj["preview_truncated"] is True
 
 
+def test_jsonable_bytes_matches_compact_schema():
+    data = b"b" * (32 * 1024)
+    obj = ccl_wrapper.jsonable(data)
+    assert obj == ccl_wrapper.compact_bytes_json(data)
+    assert "text_preview" not in obj
+
+
 def test_export_local_storage_missing_dir(tmp_path: Path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
@@ -178,10 +213,44 @@ def test_export_local_storage_missing_dir(tmp_path: Path):
 
 
 def test_base64_cap_skips_decode():
-    max_chars = (ccl_wrapper.MAX_INPUT_BYTES * 4) // 3 + 8
+    limits = {
+        "max_bytes_to_process": 64,
+        "max_text_chars": 20,
+    }
+    max_chars = (limits["max_bytes_to_process"] * 4) // 3 + 8
     payload = "A" * (max_chars + 10)
-    info = ccl_wrapper.smart_decode_payload(payload)
+    info = ccl_wrapper.smart_decode_payload(payload, limits=limits)
     assert "base64_skipped_too_large" in (info.get("notes") or [])
+    assert info.get("raw_text_preview") == payload[: limits["max_text_chars"]]
+    assert info.get("raw_text_truncated") is True
+
+
+def test_snappy_failure_adds_note(monkeypatch):
+    fake_snappy = types.SimpleNamespace(decompress=lambda _data: (_ for _ in ()).throw(ValueError("boom")))
+    monkeypatch.setitem(sys.modules, "snappy", fake_snappy)
+    data = b"\x01\x02\x03\x00\xff"
+    res = ccl_wrapper._decode_bytes_pipeline(
+        data,
+        max_input_bytes=ccl_wrapper.MAX_INPUT_BYTES,
+        max_decoded_bytes=ccl_wrapper.MAX_DECODED_BYTES,
+        max_depth=ccl_wrapper.MAX_DECODE_DEPTH,
+    )
+    assert "snappy_failed" in (res.get("notes") or [])
+    assert "snappy" not in res.get("transform_chain", [])
+
+
+def test_snappy_skips_plain_text(monkeypatch):
+    fake_snappy = types.SimpleNamespace(decompress=lambda _data: (_ for _ in ()).throw(ValueError("boom")))
+    monkeypatch.setitem(sys.modules, "snappy", fake_snappy)
+    data = b"hello world"
+    res = ccl_wrapper._decode_bytes_pipeline(
+        data,
+        max_input_bytes=ccl_wrapper.MAX_INPUT_BYTES,
+        max_decoded_bytes=ccl_wrapper.MAX_DECODED_BYTES,
+        max_depth=ccl_wrapper.MAX_DECODE_DEPTH,
+    )
+    assert "snappy" not in res.get("transform_chain", [])
+    assert "snappy_failed" not in (res.get("notes") or [])
 
 
 def test_find_blob_indices_none_blob_type():
